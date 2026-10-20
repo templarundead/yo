@@ -307,7 +307,11 @@ pub enum AmbiguousPolicy {
 }
 
 impl AmbiguousPolicy {
-    pub const ALL: [AmbiguousPolicy; 3] = [AmbiguousPolicy::Yo, AmbiguousPolicy::Ye, AmbiguousPolicy::Ask];
+    pub const ALL: [AmbiguousPolicy; 3] = [
+        AmbiguousPolicy::Yo,
+        AmbiguousPolicy::Ye,
+        AmbiguousPolicy::Ask,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -596,7 +600,7 @@ impl Dictionary {
         d
     }
 
-    fn is_sorted(&self) -> bool {
+    pub fn is_sorted(&self) -> bool {
         self.lc
             .windows(2)
             .enumerate()
@@ -626,7 +630,9 @@ impl Dictionary {
         };
         let reorder_u8 = |src: &mut Vec<AtomicU8>| {
             let old = std::mem::take(src);
-            *src = (0..n).map(|i| AtomicU8::new(old[idx(i)].load(AtomicOrdering::Relaxed))).collect();
+            *src = (0..n)
+                .map(|i| AtomicU8::new(old[idx(i)].load(AtomicOrdering::Relaxed)))
+                .collect();
         };
         reorder_strings(&mut self.ye);
         reorder_strings(&mut self.lc);
@@ -723,7 +729,7 @@ impl Dictionary {
     /// (`RestLowerCase`), затем — целиком в нижнем регистре.
     ///
     /// `buf_a`/`buf_b` — переиспользуемые буферы движка.
-    fn find_ul(&self, s: &str, buf_a: &mut String, buf_b: &mut String) -> Option<usize> {
+    pub fn find_ul(&self, s: &str, buf_a: &mut String, buf_b: &mut String) -> Option<usize> {
         // RestLowerCase: первая буква как есть, остальные — в нижний регистр.
         buf_a.clear();
         buf_a.reserve(s.len());
@@ -1229,7 +1235,9 @@ impl Engine {
 
             if !self.word.is_empty() {
                 let word = std::mem::take(&mut self.word);
-                let undo = self.handle_word(&word, word_start, idx, c, word_len, word_ye_yo, word_yo, input, sink);
+                let undo = self.handle_word(
+                    &word, word_start, idx, c, word_len, word_ye_yo, word_yo, input, sink,
+                );
                 self.word = word;
                 self.word.clear();
                 self.stats.words += 1;
@@ -1255,7 +1263,9 @@ impl Engine {
         if stop_at >= head.len() && !self.word.is_empty() {
             // Последнее слово в проверяемой части текста.
             let word = std::mem::take(&mut self.word);
-            self.handle_word(&word, word_start, head.len(), '\n', word_len, word_ye_yo, word_yo, input, sink);
+            self.handle_word(
+                &word, word_start, head.len(), '\n', word_len, word_ye_yo, word_yo, input, sink,
+            );
             self.word = word;
             self.word.clear();
             self.stats.words += 1;
@@ -1406,7 +1416,9 @@ impl Engine {
         let base = self.emitted;
         if offset >= base {
             let rel = offset - base;
-            if rel + new.len() <= self.out.len() && &self.out[rel..rel + new.len()] == new.as_str() {
+            if rel + new.len() <= self.out.len()
+                && &self.out[rel..rel + new.len()] == new.as_str()
+            {
                 self.out.replace_range(rel..rel + new.len(), &old);
                 self.marks
                     .retain(|&(s, _)| !(s >= offset && s < offset + new.len()));
@@ -1441,7 +1453,8 @@ impl Engine {
         to_ye_into(c_word, &mut self.b_word1);
 
         // FindReplacement
-        let (dic_index, mut to_ask, mut focus, always) = match dic.find_ul(&self.b_word1, &mut self.b_key, &mut self.b_lc) {
+        let (dic_index, mut to_ask, mut focus, always) =
+            match dic.find_ul(&self.b_word1, &mut self.b_key, &mut self.b_lc) {
             Some(i) => {
                 sel.dic_index = Some(i);
                 let remembered = dic.user_sel(i);
@@ -1466,7 +1479,8 @@ impl Engine {
             && self.opts.to_confirm_abbr
             && terminator == '.'
             && is_abbreviation_at(input, word_end + terminator.len_utf8());
-        let to_check_ell = has_w2 && self.opts.to_confirm_ellipsis && is_ellipsis_at(input, word_end);
+        let to_check_ell =
+            has_w2 && self.opts.to_confirm_ellipsis && is_ellipsis_at(input, word_end);
 
         to_ask = to_ask
             || (has_w2 && to_check_abbr)

@@ -1,7 +1,7 @@
 //! # YOL — «Ё лайт»
 //!
 //! GUI-часть: главное окно на `egui`/`eframe`, фоновый рабочий поток и
-//! консольный потоковый режим. Вся логика ёфикации живёт в [`yo_core`].
+//! консольный потоковый режим. Вся логика ёфикации живёт в [`yol::yo_core`].
 //!
 //! ## Архитектура
 //!
@@ -18,17 +18,17 @@
 //! по 64 КБ, статистика — примерно 15 раз в секунду. Поэтому интерфейс не
 //! «фризится» даже на стомегабайтных файлах.
 
-mod yo_core;
-
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::Instant;
 
-use yo_core::{
-    database_info, AskDecision, AskRequest, Engine, Sink, Stats, TextEncoding, YoOptions,
-    YO_VERSION,
+// Ядро живёт в библиотеке `yol` (src/lib.rs → src/yo_core.rs), а не подключается
+// модулем: так его же можно покрывать интеграционными тестами из tests/.
+use yol::yo_core::{
+    clear_user_selections, database_info, decode_bytes, decode_cp1251, encode_string, preload,
+    AmbiguousPolicy, AskDecision, AskRequest, Engine, Sink, Stats, TextEncoding, YoOptions,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -36,6 +36,9 @@ use yo_core::{
 // ═══════════════════════════════════════════════════════════════════════════
 
 const APP_NAME: &str = "YOL — Ё лайт";
+
+/// Версия для окна «О программе» и `yol --version`.
+const VERSION: &str = yol::yo_core::YO_VERSION;
 
 /// Выше этой длины редактор egui начинает ощутимо тормозить — предлагаем
 /// файловый режим (он потоковый и ничем не ограничен).
@@ -237,7 +240,7 @@ fn list_dir(dir: &Path) -> Vec<(String, bool)> {
 fn decode_with(bytes: &[u8], enc: TextEncoding) -> String {
     let has_bom = |prefix: &[u8]| bytes.len() >= prefix.len() && &bytes[..prefix.len()] == prefix;
     match enc {
-        TextEncoding::Cp1251 => yo_core::decode_cp1251(bytes),
+        TextEncoding::Cp1251 => decode_cp1251(bytes),
         TextEncoding::Utf8 | TextEncoding::Utf8Bom => {
             let skip = if has_bom(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
             String::from_utf8_lossy(&bytes[skip..]).into_owned()
@@ -310,7 +313,7 @@ impl YoApp {
 
         // Словари (1.8 МБ) разбираем в фоне: окно появляется мгновенно,
         // а первый прогон всё равно дождётся готовности базы.
-        std::thread::spawn(yo_core::preload);
+        std::thread::spawn(preload);
 
         Self {
             opts: YoOptions::default(),
@@ -531,7 +534,7 @@ impl YoApp {
             Ok(bytes) => {
                 let (text, detected) = match enc {
                     Some(e) => (decode_with(&bytes, e), e),
-                    None => yo_core::decode_bytes(&bytes),
+                    None => decode_bytes(&bytes),
                 };
                 let n = text.chars().count();
                 self.input = text;
@@ -552,7 +555,7 @@ impl YoApp {
     }
 
     fn save_path(&mut self, path: PathBuf, enc: TextEncoding) {
-        let bytes = yo_core::encode_string(&self.output, enc);
+        let bytes = encode_string(&self.output, enc);
         match std::fs::write(&path, bytes) {
             Ok(()) => {
                 self.current_file = Some(path.clone());
@@ -609,21 +612,28 @@ fn setup_style(ctx: &egui::Context) {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(10.0, 5.0);
 
-        style
-            .text_styles
-            .insert(egui::TextStyle::Monospace, egui::FontId::new(14.5, egui::FontFamily::Monospace));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Body, egui::FontId::new(14.0, egui::FontFamily::Proportional));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Button, egui::FontId::new(14.0, egui::FontFamily::Proportional));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Small, egui::FontId::new(12.0, egui::FontFamily::Proportional));
-        style.text_styles.insert(
+        // `fn_call_width` у rustfmt по умолчанию 60, поэтому аргументы
+        // записываем вертикально — так файл остаётся стабильным под `cargo fmt`.
+        let ts = &mut style.text_styles;
+        ts.insert(
+            egui::TextStyle::Small,
+            egui::FontId::new(12.0, egui::FontFamily::Proportional),
+        );
+        ts.insert(
+            egui::TextStyle::Body,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        );
+        ts.insert(
+            egui::TextStyle::Button,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        );
+        ts.insert(
             egui::TextStyle::Heading,
             egui::FontId::new(19.0, egui::FontFamily::Proportional),
+        );
+        ts.insert(
+            egui::TextStyle::Monospace,
+            egui::FontId::new(14.5, egui::FontFamily::Monospace),
         );
     });
 }
@@ -700,7 +710,7 @@ impl YoApp {
                     ui.separator();
                     if let Some(path) = &self.current_file {
                         ui.label(
-                            egui::RichText::new(path.to_string_lossy().to_string())
+                            egui::RichText::new(path.to_string_lossy().into_owned())
                                 .small()
                                 .color(COLOR_DIM),
                         );
@@ -751,7 +761,7 @@ impl YoApp {
                     }
                     ui.separator();
                     if ui.button("Сбросить «всегда Е/Ё»").clicked() {
-                        yo_core::clear_user_selections();
+                        clear_user_selections();
                         self.status_left = "память ответов очищена".to_owned();
                         ui.close_menu();
                     }
@@ -855,7 +865,7 @@ impl YoApp {
                 ui.label("Неоднозначные:");
                 if ui
                     .button(self.opts.ambiguous.label())
-                    .on_hover_text("Что делать со словами, помеченными «?» (нажмите, чтобы переключить)")
+                    .on_hover_text("Слова, помеченные «?»: клик переключает")
                     .clicked()
                 {
                     self.opts.ambiguous = next_policy(self.opts.ambiguous);
@@ -1074,12 +1084,21 @@ impl YoApp {
                         self.answer(AskDecision::Cancel);
                     }
                     if ask.wrong_yo {
-                        ui.colored_label(COLOR_MARK, egui::RichText::new("подозрительная «ё»").small());
+                        ui.colored_label(
+                            COLOR_MARK,
+                            egui::RichText::new("подозрительная «ё»").small(),
+                        );
                     } else if ask.replaced_yo {
-                        ui.colored_label(COLOR_MARK, egui::RichText::new("«ё» стоит не там").small());
+                        ui.colored_label(
+                            COLOR_MARK,
+                            egui::RichText::new("«ё» стоит не там").small(),
+                        );
                     }
                     if ask.wrong_ye {
-                        ui.colored_label(COLOR_YE, egui::RichText::new("замена без запроса").small());
+                        ui.colored_label(
+                            COLOR_YE,
+                            egui::RichText::new("замена без запроса").small(),
+                        );
                     }
                 });
 
@@ -1145,11 +1164,11 @@ fn stats_row(ui: &mut egui::Ui, key: &str, value: String) {
 }
 
 /// Следующий вариант политики для неоднозначных слов (кнопка-переключатель).
-fn next_policy(p: yo_core::AmbiguousPolicy) -> yo_core::AmbiguousPolicy {
+fn next_policy(p: AmbiguousPolicy) -> AmbiguousPolicy {
     match p {
-        yo_core::AmbiguousPolicy::Yo => yo_core::AmbiguousPolicy::Ye,
-        yo_core::AmbiguousPolicy::Ye => yo_core::AmbiguousPolicy::Ask,
-        yo_core::AmbiguousPolicy::Ask => yo_core::AmbiguousPolicy::Yo,
+        AmbiguousPolicy::Yo => AmbiguousPolicy::Ye,
+        AmbiguousPolicy::Ye => AmbiguousPolicy::Ask,
+        AmbiguousPolicy::Ask => AmbiguousPolicy::Yo,
     }
 }
 
@@ -1365,7 +1384,7 @@ impl YoApp {
                 });
                 ui.horizontal(|ui| {
                     ui.label("Неоднозначные слова:");
-                    for p in yo_core::AmbiguousPolicy::ALL {
+                    for p in AmbiguousPolicy::ALL {
                         ui.radio_value(&mut o.ambiguous, p, p.label());
                     }
                 });
@@ -1410,7 +1429,7 @@ impl YoApp {
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.heading(egui::RichText::new("YOL — «Ё лайт»").strong());
-                    ui.label(format!("версия {YO_VERSION}"));
+                    ui.label(format!("версия {VERSION}"));
                 });
                 ui.separator();
                 ui.label("Программа для ёфикации русских текстов.");
@@ -1509,11 +1528,15 @@ impl YoApp {
                                 let (from, to) = &self.journal[i];
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        egui::RichText::new(from.as_str()).monospace().color(COLOR_YE),
+                                        egui::RichText::new(from.as_str())
+                                            .monospace()
+                                            .color(COLOR_YE),
                                     );
                                     ui.label(egui::RichText::new("→").monospace());
                                     ui.label(
-                                        egui::RichText::new(to.as_str()).monospace().color(COLOR_YO),
+                                        egui::RichText::new(to.as_str())
+                                            .monospace()
+                                            .color(COLOR_YO),
                                     );
                                 });
                             }
@@ -1595,9 +1618,9 @@ impl Args {
                 "--word-wrap" => a.opts.word_wrap = true,
                 "--ambiguous" => match it.next() {
                     Some(v) => match v.as_str() {
-                        "yo" | "ё" => a.opts.ambiguous = yo_core::AmbiguousPolicy::Yo,
-                        "ye" | "е" => a.opts.ambiguous = yo_core::AmbiguousPolicy::Ye,
-                        "ask" => a.opts.ambiguous = yo_core::AmbiguousPolicy::Ask,
+                        "yo" | "ё" => a.opts.ambiguous = AmbiguousPolicy::Yo,
+                        "ye" | "е" => a.opts.ambiguous = AmbiguousPolicy::Ye,
+                        "ask" => a.opts.ambiguous = AmbiguousPolicy::Ask,
                         other => a.error = Some(format!("неизвестная политика: {other}")),
                     },
                     None => a.error = Some("не указано значение --ambiguous".into()),
@@ -1672,7 +1695,7 @@ impl<W: std::io::Write> Sink for EncodingSink<W> {
                 other => other,
             }
         };
-        let _ = self.writer.write_all(&yo_core::encode_string(text, enc));
+        let _ = self.writer.write_all(&encode_string(text, enc));
     }
 
     fn stats(&mut self, stats: Stats) {
@@ -1721,7 +1744,7 @@ fn run_cli(args: Args) -> i32 {
 
     let (text, detected) = match args.in_enc {
         Some(e) => (decode_with(&data, e), e),
-        None => yo_core::decode_bytes(&data),
+        None => decode_bytes(&data),
     };
 
     if !args.quiet {
@@ -1837,7 +1860,7 @@ fn main() -> eframe::Result<()> {
         std::process::exit(2);
     }
     if args.version {
-        println!("yol {YO_VERSION}");
+        println!("yol {VERSION}");
         return Ok(());
     }
     if args.help {

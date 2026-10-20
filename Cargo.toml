@@ -23,6 +23,14 @@ categories = ["text-processing", "gui"]
 exclude = ["binary/*", "images/*", "legacy/*"]
 build = "build.rs"
 
+# Библиотечная цель нужна не «для красоты»: интеграционные тесты из tests/
+# не могут импортировать модули бинарного крейта, а GUI при этом остаётся
+# отдельным бинарником и не тянет egui внутрь ядра.
+[lib]
+name = "yol"
+path = "src/lib.rs"
+doctest = true
+
 [[bin]]
 name = "yol"
 path = "src/main.rs"
