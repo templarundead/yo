@@ -99,7 +99,8 @@ fn unknown_words_are_absent() {
     let d = dictionary();
     let mut a = String::new();
     let mut b = String::new();
-    for w in ["крокозябра", "фтыкалка", "ыыыыыы", "zzzzzz", "щщщщщщ"] {
+    for w in ["крокозябра", "фтыкалка", "ыыыыыы", "zzzzzz", "щщщщщщ"]
+    {
         assert!(
             d.find_ul(w, &mut a, &mut b).is_none(),
             "{w:?} внезапно найдено в базе"

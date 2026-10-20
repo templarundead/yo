@@ -1264,7 +1264,15 @@ impl Engine {
             // Последнее слово в проверяемой части текста.
             let word = std::mem::take(&mut self.word);
             self.handle_word(
-                &word, word_start, head.len(), '\n', word_len, word_ye_yo, word_yo, input, sink,
+                &word,
+                word_start,
+                head.len(),
+                '\n',
+                word_len,
+                word_ye_yo,
+                word_yo,
+                input,
+                sink,
             );
             self.word = word;
             self.word.clear();
@@ -1383,7 +1391,8 @@ impl Engine {
             let old_ch = old_chars.next();
             let len = new_ch.len_utf8();
             if Some(new_ch) != old_ch && self.opts.mark && self.marks.len() < MAX_MARKS {
-                self.marks.push((offset + byte_off, offset + byte_off + len));
+                self.marks
+                    .push((offset + byte_off, offset + byte_off + len));
             }
             result.push(new_ch);
             byte_off += len;
@@ -1416,8 +1425,7 @@ impl Engine {
         let base = self.emitted;
         if offset >= base {
             let rel = offset - base;
-            if rel + new.len() <= self.out.len()
-                && &self.out[rel..rel + new.len()] == new.as_str()
+            if rel + new.len() <= self.out.len() && &self.out[rel..rel + new.len()] == new.as_str()
             {
                 self.out.replace_range(rel..rel + new.len(), &old);
                 self.marks
@@ -1455,18 +1463,18 @@ impl Engine {
         // FindReplacement
         let (dic_index, mut to_ask, mut focus, always) =
             match dic.find_ul(&self.b_word1, &mut self.b_key, &mut self.b_lc) {
-            Some(i) => {
-                sel.dic_index = Some(i);
-                let remembered = dic.user_sel(i);
-                if remembered != 0 {
-                    (Some(i), false, remembered, true)
-                } else {
-                    let ask = dic.ask(i);
-                    (Some(i), ask, if ask { dic.answer(i) } else { 2 }, false)
+                Some(i) => {
+                    sel.dic_index = Some(i);
+                    let remembered = dic.user_sel(i);
+                    if remembered != 0 {
+                        (Some(i), false, remembered, true)
+                    } else {
+                        let ask = dic.ask(i);
+                        (Some(i), ask, if ask { dic.answer(i) } else { 2 }, false)
+                    }
                 }
-            }
-            None => (None, false, 1u8, false),
-        };
+                None => (None, false, 1u8, false),
+            };
         let has_w2 = dic_index.is_some();
 
         self.b_word2.clear();
@@ -1758,7 +1766,9 @@ pub fn match_regexp(
         for gi in 1..caps.len() {
             let Some(m) = caps.get(gi) else { continue };
             let (s, e) = (m.start(), m.end());
-            let Some(slice) = context.get(s..e) else { continue };
+            let Some(slice) = context.get(s..e) else {
+                continue;
+            };
             let mut slice_chars = slice.chars();
             let first = match slice_chars.next() {
                 Some(c) => c,
@@ -1980,7 +1990,9 @@ mod tests {
 
     fn run(input: &str, opts: YoOptions) -> (String, Stats) {
         let mut engine = Engine::new(opts);
-        let mut sink = Collector { text: String::new() };
+        let mut sink = Collector {
+            text: String::new(),
+        };
         let stats = engine.process(input, &mut sink);
         (sink.text, stats)
     }
@@ -2041,7 +2053,11 @@ mod tests {
     fn regexp_dictionary_is_compiled() {
         let r = regex_dictionary();
         assert!(r.len() > 50, "правил слишком мало: {}", r.len());
-        assert!(r.invalid().is_empty(), "не скомпилировалось: {:?}", r.invalid());
+        assert!(
+            r.invalid().is_empty(),
+            "не скомпилировалось: {:?}",
+            r.invalid()
+        );
     }
 
     #[test]

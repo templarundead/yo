@@ -5,9 +5,7 @@
 //! в кракозябры. Проверяем распознавание по BOM, фолбэк на CP1251 и
 //! симметричность `decode` / `encode`.
 
-use yol::yo_core::{
-    decode_bytes, decode_cp1251, encode_cp1251, encode_string, TextEncoding,
-};
+use yol::yo_core::{decode_bytes, decode_cp1251, encode_cp1251, encode_string, TextEncoding};
 
 const TEXT: &str = "Актер вышел на сцену, береза у елки. 42.";
 

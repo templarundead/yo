@@ -267,10 +267,14 @@ fn cancel_stops_the_run() {
     }
 
     let mut sink = Cancel;
-    let stats = Engine::new(opts(|o| o.always_ask = true))
-        .process("актер вышел на сцену", &mut sink);
+    let stats =
+        Engine::new(opts(|o| o.always_ask = true)).process("актер вышел на сцену", &mut sink);
     assert_eq!(stats.asked, 1);
-    assert!(stats.words <= 2, "после отмены слов почти не обработано: {}", stats.words);
+    assert!(
+        stats.words <= 2,
+        "после отмены слов почти не обработано: {}",
+        stats.words
+    );
 }
 
 /// Неоднозначные слова в пакетном режиме разрешаются политикой, без вопросов.
@@ -292,7 +296,10 @@ fn ambiguous_policy_decides_without_asking() {
         }),
     );
 
-    assert!(ye.0.asks.is_empty() && yo.0.asks.is_empty(), "пакетный режим вопросов не задаёт");
+    assert!(
+        ye.0.asks.is_empty() && yo.0.asks.is_empty(),
+        "пакетный режим вопросов не задаёт"
+    );
     assert_eq!(ye.0.text, "все актёр", "политика «оставить Е»");
     assert_eq!(yo.0.text, "всё актёр", "политика «ставить Ё»");
 }
@@ -316,7 +323,10 @@ fn regexp_rule_resolves_an_ambiguous_word() {
         "правило «всё время» должно сработать — иначе порт MatchRegExp сломан"
     );
     assert_eq!(with.text, "всё время");
-    assert_eq!(without.stats.re, 0, "с выключенными правилами их быть не должно");
+    assert_eq!(
+        without.stats.re, 0,
+        "с выключенными правилами их быть не должно"
+    );
     assert_eq!(without.stats.no_re, 0);
     assert_eq!(without.text, "все время");
 }
@@ -360,7 +370,11 @@ fn stats_count_what_the_gui_shows() {
     assert_eq!(s.yo_to_e, 0);
     assert_eq!(s.chars, src.chars().count() as u64);
     assert!(!s.classic().is_empty(), "строка состояния пустая");
-    assert!(s.classic().contains("REQ:"), "строка состояния: {}", s.classic());
+    assert!(
+        s.classic().contains("REQ:"),
+        "строка состояния: {}",
+        s.classic()
+    );
 }
 
 #[test]
@@ -383,14 +397,20 @@ fn marks_point_at_the_changed_letters() {
 fn marks_are_disabled_when_marking_is_off() {
     let (sink, _) = process("Актер", opts(|o| o.mark = false));
     assert_eq!(sink.text, "Актёр");
-    assert!(sink.marks.is_empty(), "с выключенной пометкой меток быть не должно");
+    assert!(
+        sink.marks.is_empty(),
+        "с выключенной пометкой меток быть не должно"
+    );
 }
 
 #[test]
 fn journal_records_replacements() {
     let (sink, _) = process("Актер береза елка", YoOptions::default());
     assert_eq!(sink.journal.len(), 3, "журнал: {:?}", sink.journal);
-    assert!(sink.journal.iter().any(|(a, b)| a == "Актер" && b == "Актёр"));
+    assert!(sink
+        .journal
+        .iter()
+        .any(|(a, b)| a == "Актер" && b == "Актёр"));
     assert!(sink.journal.iter().all(|(a, b)| a != b));
 }
 

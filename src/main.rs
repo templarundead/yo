@@ -87,7 +87,11 @@ enum Event {
     /// Вопрос к пользователю. Рабочий поток заблокирован до ответа.
     Ask(AskRequest),
     /// Откат уже отправленной замены.
-    Undo { offset: usize, old: String, new: String },
+    Undo {
+        offset: usize,
+        old: String,
+        new: String,
+    },
     /// Работа завершена.
     Done { stats: Stats },
     /// Что-то пошло не так.
@@ -771,7 +775,10 @@ impl YoApp {
                     if ui.checkbox(&mut self.dark, "Тёмная тема").clicked() {
                         ui.close_menu();
                     }
-                    if ui.checkbox(&mut self.show_journal, "Журнал замен").clicked() {
+                    if ui
+                        .checkbox(&mut self.show_journal, "Журнал замен")
+                        .clicked()
+                    {
                         ui.close_menu();
                     }
                     ui.separator();
@@ -792,8 +799,9 @@ impl YoApp {
                     }
                 });
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    match &self.dict_info {
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| match &self.dict_info {
                         Some((words, _, rules, _, _)) => {
                             ui.label(
                                 egui::RichText::new(format!("слов: {words} · правил: {rules}"))
@@ -808,8 +816,8 @@ impl YoApp {
                                     .color(COLOR_DIM),
                             );
                         }
-                    }
-                });
+                    },
+                );
             });
         });
     }
@@ -820,13 +828,15 @@ impl YoApp {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 // ── главная кнопка ──────────────────────────────────────
-                let btn = egui::Button::new(
-                    egui::RichText::new("Ёфицировать").strong().color(COLOR_YO),
-                );
+                let btn =
+                    egui::Button::new(egui::RichText::new("Ёфицировать").strong().color(COLOR_YO));
                 if ui.add_enabled(!self.busy(), btn).clicked() {
                     self.start();
                 }
-                if ui.add_enabled(self.busy(), egui::Button::new("Стоп")).clicked() {
+                if ui
+                    .add_enabled(self.busy(), egui::Button::new("Стоп"))
+                    .clicked()
+                {
                     self.stop();
                 }
                 ui.separator();
@@ -899,7 +909,8 @@ impl YoApp {
                 } else {
                     ui.visuals().widgets.noninteractive.bg_fill
                 };
-                ui.painter().rect_filled(rect, egui::CornerRadius::same(3), c);
+                ui.painter()
+                    .rect_filled(rect, egui::CornerRadius::same(3), c);
 
                 ui.allocate_ui(egui::vec2(right_w, avail.y), |ui| {
                     self.editor_pane(ui, false);
@@ -982,39 +993,39 @@ impl YoApp {
             && self.output.len() <= MAX_HIGHLIGHT_CHARS;
 
         ui.push_id(if is_input { "scroll_in" } else { "scroll_out" }, |ui| {
-        egui::ScrollArea::both()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let width = if self.opts.word_wrap {
-                    ui.available_width()
-                } else {
-                    f32::INFINITY
-                };
-                if highlighted {
-                    highlighted_label(ui, &self.output, &self.marks);
-                } else if is_input {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.input)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(width)
-                            .frame(false)
-                            .hint_text(
-                                "Вставьте текст или загрузите файл (Файл → Загрузить текст…)",
-                            ),
-                    );
-                } else {
-                    let r = ui.add(
-                        egui::TextEdit::multiline(&mut self.output)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(width)
-                            .frame(false),
-                    );
-                    if r.changed() {
-                        // Ручная правка результата делает пометки неверными.
-                        self.marks.clear();
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let width = if self.opts.word_wrap {
+                        ui.available_width()
+                    } else {
+                        f32::INFINITY
+                    };
+                    if highlighted {
+                        highlighted_label(ui, &self.output, &self.marks);
+                    } else if is_input {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.input)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(width)
+                                .frame(false)
+                                .hint_text(
+                                    "Вставьте текст или загрузите файл (Файл → Загрузить текст…)",
+                                ),
+                        );
+                    } else {
+                        let r = ui.add(
+                            egui::TextEdit::multiline(&mut self.output)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(width)
+                                .frame(false),
+                        );
+                        if r.changed() {
+                            // Ручная правка результата делает пометки неверными.
+                            self.marks.clear();
+                        }
                     }
-                }
-            });
+                });
         });
     }
 
@@ -1033,7 +1044,11 @@ impl YoApp {
                 ui.add_space(2.0);
 
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new(ask.before.as_str()).monospace().color(COLOR_DIM));
+                    ui.label(
+                        egui::RichText::new(ask.before.as_str())
+                            .monospace()
+                            .color(COLOR_DIM),
+                    );
 
                     let label1 = if ask.focus_first {
                         format!("{} (1)", ask.word1)
@@ -1046,27 +1061,33 @@ impl YoApp {
                         format!("{} (2)", ask.word2)
                     };
                     if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(label1).monospace().strong().color(COLOR_YE),
-                            ),
-                        )
+                        .add(egui::Button::new(
+                            egui::RichText::new(label1)
+                                .monospace()
+                                .strong()
+                                .color(COLOR_YE),
+                        ))
                         .clicked()
                     {
                         self.answer(AskDecision::Ye);
                     }
                     ui.label(egui::RichText::new("/").monospace().color(COLOR_DIM));
                     if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(label2).monospace().strong().color(COLOR_YO),
-                            ),
-                        )
+                        .add(egui::Button::new(
+                            egui::RichText::new(label2)
+                                .monospace()
+                                .strong()
+                                .color(COLOR_YO),
+                        ))
                         .clicked()
                     {
                         self.answer(AskDecision::Yo);
                     }
-                    ui.label(egui::RichText::new(ask.after.as_str()).monospace().color(COLOR_DIM));
+                    ui.label(
+                        egui::RichText::new(ask.after.as_str())
+                            .monospace()
+                            .color(COLOR_DIM),
+                    );
                 });
 
                 ui.add_space(4.0);
@@ -1266,41 +1287,41 @@ impl YoApp {
                 // ── список ─────────────────────────────────────────────
                 let entries = self.dialog.entries.clone();
                 ui.push_id("file_list", |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for (name, is_dir) in entries {
-                            let label = if is_dir {
-                                format!("[ {} ]", name)
-                            } else {
-                                name.clone()
-                            };
-                            let resp = ui.add(
-                                egui::Button::new(label)
-                                    .frame(false)
-                                    .fill(egui::Color32::TRANSPARENT),
-                            );
-                            if resp.double_clicked() {
-                                if is_dir {
-                                    new_dir = Some(self.dialog.dir.join(&name));
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for (name, is_dir) in entries {
+                                let label = if is_dir {
+                                    format!("[ {} ]", name)
                                 } else {
-                                    action = Some(if self.dialog.is_save {
-                                        FileAction::Save(
-                                            self.dialog.dir.join(&name),
-                                            self.dialog.encoding,
-                                        )
+                                    name.clone()
+                                };
+                                let resp = ui.add(
+                                    egui::Button::new(label)
+                                        .frame(false)
+                                        .fill(egui::Color32::TRANSPARENT),
+                                );
+                                if resp.double_clicked() {
+                                    if is_dir {
+                                        new_dir = Some(self.dialog.dir.join(&name));
                                     } else {
-                                        FileAction::Load(
-                                            self.dialog.dir.join(&name),
-                                            self.dialog.encoding,
-                                        )
-                                    });
+                                        action = Some(if self.dialog.is_save {
+                                            FileAction::Save(
+                                                self.dialog.dir.join(&name),
+                                                self.dialog.encoding,
+                                            )
+                                        } else {
+                                            FileAction::Load(
+                                                self.dialog.dir.join(&name),
+                                                self.dialog.encoding,
+                                            )
+                                        });
+                                    }
+                                } else if resp.clicked() {
+                                    self.dialog.name = name.clone();
                                 }
-                            } else if resp.clicked() {
-                                self.dialog.name = name.clone();
                             }
-                        }
-                    });
+                        });
                 });
 
                 ui.separator();
@@ -1365,14 +1386,20 @@ impl YoApp {
             .show(ctx, |ui| {
                 ui.heading("Ёфикация");
                 let o = &mut self.opts;
-                ui.checkbox(&mut o.reg_exprs, "Использование словаря регулярных выражений");
+                ui.checkbox(
+                    &mut o.reg_exprs,
+                    "Использование словаря регулярных выражений",
+                );
                 ui.checkbox(&mut o.no_var_only, "Только безопасные замены");
                 ui.checkbox(&mut o.var_only, "Только интерактивные замены");
                 ui.checkbox(&mut o.check_yo, "Проверять расстановку «ё»");
                 ui.checkbox(&mut o.always_ask, "Всегда подтверждать замену");
                 ui.checkbox(&mut o.to_confirm_abbr, "…подтверждать для сокращений");
                 ui.checkbox(&mut o.to_confirm_cap, "…подтверждать для имён собственных");
-                ui.checkbox(&mut o.to_confirm_ellipsis, "…подтверждать для оборванных слов");
+                ui.checkbox(
+                    &mut o.to_confirm_ellipsis,
+                    "…подтверждать для оборванных слов",
+                );
                 ui.checkbox(&mut o.propose_last, "Предлагать последний вариант замены");
                 ui.checkbox(&mut o.fb_format, "Учитывать формат «FictionBook»");
                 ui.checkbox(&mut o.fast_scroll, "Быстрая прокрутка");
@@ -1891,5 +1918,9 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(APP_NAME, options, Box::new(|cc| Ok(Box::new(YoApp::new(cc)))))
+    eframe::run_native(
+        APP_NAME,
+        options,
+        Box::new(|cc| Ok(Box::new(YoApp::new(cc)))),
+    )
 }

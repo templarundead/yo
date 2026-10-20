@@ -40,7 +40,11 @@ fn read(path: &Path) -> String {
 #[test]
 fn version_prints_and_exits_zero() {
     let out = yol().arg("--version").output().expect("не запустился");
-    assert!(out.status.success(), "код возврата: {:?}", out.status.code());
+    assert!(
+        out.status.success(),
+        "код возврата: {:?}",
+        out.status.code()
+    );
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.starts_with("yol "), "вывод: {text:?}");
     assert!(
@@ -62,7 +66,10 @@ fn help_prints_usage_and_exits_zero() {
 
 #[test]
 fn unknown_flag_is_rejected() {
-    let out = yol().arg("--такого-ключа-нет").output().expect("не запустился");
+    let out = yol()
+        .arg("--такого-ключа-нет")
+        .output()
+        .expect("не запустился");
     assert_eq!(out.status.code(), Some(2), "неизвестный ключ — это код 2");
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("неизвестный ключ"), "stderr: {err:?}");
@@ -99,7 +106,11 @@ fn file_to_file_is_yofied() {
         .output()
         .expect("не запустился");
 
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(read(&dst), "Актёр вышел на сцену, а берёза стояла у ёлки.");
 
     let _ = std::fs::remove_file(&src);
@@ -166,7 +177,11 @@ fn positional_arguments_work_as_input_and_output() {
         .args(["--out-enc", "utf8"])
         .output()
         .expect("не запустился");
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(read(&dst), "ёлка");
 
     let _ = std::fs::remove_file(&src);
@@ -196,7 +211,11 @@ fn stdin_to_stdout_is_yofied() {
         .expect("запись в stdin");
 
     let out = child.wait_with_output().expect("ожидание");
-    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = String::from_utf8(out.stdout).expect("stdout не в UTF-8");
     assert_eq!(text, "Актёр и ёлка");
 }
