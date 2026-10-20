@@ -323,10 +323,7 @@ fn regexp_rule_resolves_an_ambiguous_word() {
         "правило «всё время» должно сработать — иначе порт MatchRegExp сломан"
     );
     assert_eq!(with_sink.text, "всё время");
-    assert_eq!(
-        without.re, 0,
-        "с выключенными правилами их быть не должно"
-    );
+    assert_eq!(without.re, 0, "с выключенными правилами их быть не должно");
     assert_eq!(without.no_re, 0);
     assert_eq!(without_sink.text, "все время");
 }
