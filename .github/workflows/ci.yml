@@ -95,7 +95,7 @@ jobs:
   #  STAGE 2 — релизные бинарники
   # ═══════════════════════════════════════════════════════════════════════════
   build:
-    name: Stage 2 · Build ${{ matrix.name }}
+    name: Stage 2 · Build
     needs: lint-and-test
     runs-on: ${{ matrix.os }}
     strategy:
