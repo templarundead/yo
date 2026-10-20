@@ -1,7 +1,7 @@
 //! # YOL — «Ё лайт»
 //!
 //! GUI-часть: главное окно на `egui`/`eframe`, фоновый рабочий поток и
-//! консольный потоковый режим. Вся логика ёфикации живёт в [`yo_core`].
+//! консольный потоковый режим. Вся логика ёфикации живёт в [`yol::yo_core`].
 //!
 //! ## Архитектура
 //!
@@ -18,17 +18,18 @@
 //! по 64 КБ, статистика — примерно 15 раз в секунду. Поэтому интерфейс не
 //! «фризится» даже на стомегабайтных файлах.
 
-mod yo_core;
-
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::Instant;
 
-use yo_core::{
-    database_info, AskDecision, AskRequest, Engine, Sink, Stats, TextEncoding, YoOptions,
-    YO_VERSION,
+// Ядро живёт в библиотеке `yol` (src/lib.rs → src/yo_core.rs), а не подключается
+// модулем: так его же можно покрывать интеграционными тестами из tests/.
+use yol::yo_core::{
+    clear_user_selections, database_info, decode_bytes, decode_cp1251, encode_string, preload,
+    AmbiguousPolicy, AskDecision, AskRequest, Engine, Sink, Stats, TextEncoding, YoOptions,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -36,6 +37,9 @@ use yo_core::{
 // ═══════════════════════════════════════════════════════════════════════════
 
 const APP_NAME: &str = "YOL — Ё лайт";
+
+/// Версия для окна «О программе» и `yol --version`.
+const VERSION: &str = yol::yo_core::YO_VERSION;
 
 /// Выше этой длины редактор egui начинает ощутимо тормозить — предлагаем
 /// файловый режим (он потоковый и ничем не ограничен).
@@ -84,7 +88,11 @@ enum Event {
     /// Вопрос к пользователю. Рабочий поток заблокирован до ответа.
     Ask(AskRequest),
     /// Откат уже отправленной замены.
-    Undo { offset: usize, old: String, new: String },
+    Undo {
+        offset: usize,
+        old: String,
+        new: String,
+    },
     /// Работа завершена.
     Done { stats: Stats },
     /// Что-то пошло не так.
@@ -237,7 +245,7 @@ fn list_dir(dir: &Path) -> Vec<(String, bool)> {
 fn decode_with(bytes: &[u8], enc: TextEncoding) -> String {
     let has_bom = |prefix: &[u8]| bytes.len() >= prefix.len() && &bytes[..prefix.len()] == prefix;
     match enc {
-        TextEncoding::Cp1251 => yo_core::decode_cp1251(bytes),
+        TextEncoding::Cp1251 => decode_cp1251(bytes),
         TextEncoding::Utf8 | TextEncoding::Utf8Bom => {
             let skip = if has_bom(&[0xEF, 0xBB, 0xBF]) { 3 } else { 0 };
             String::from_utf8_lossy(&bytes[skip..]).into_owned()
@@ -310,7 +318,7 @@ impl YoApp {
 
         // Словари (1.8 МБ) разбираем в фоне: окно появляется мгновенно,
         // а первый прогон всё равно дождётся готовности базы.
-        std::thread::spawn(yo_core::preload);
+        std::thread::spawn(preload);
 
         Self {
             opts: YoOptions::default(),
@@ -419,7 +427,7 @@ impl YoApp {
 
     /// Забрать всё, что накопилось в канале (не блокируя главный поток).
     fn pump(&mut self) {
-        let Some(mut run) = self.run.take() else {
+        let Some(run) = self.run.take() else {
             return;
         };
         let mut finished = false;
@@ -531,7 +539,7 @@ impl YoApp {
             Ok(bytes) => {
                 let (text, detected) = match enc {
                     Some(e) => (decode_with(&bytes, e), e),
-                    None => yo_core::decode_bytes(&bytes),
+                    None => decode_bytes(&bytes),
                 };
                 let n = text.chars().count();
                 self.input = text;
@@ -552,7 +560,7 @@ impl YoApp {
     }
 
     fn save_path(&mut self, path: PathBuf, enc: TextEncoding) {
-        let bytes = yo_core::encode_string(&self.output, enc);
+        let bytes = encode_string(&self.output, enc);
         match std::fs::write(&path, bytes) {
             Ok(()) => {
                 self.current_file = Some(path.clone());
@@ -609,21 +617,28 @@ fn setup_style(ctx: &egui::Context) {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         style.spacing.button_padding = egui::vec2(10.0, 5.0);
 
-        style
-            .text_styles
-            .insert(egui::TextStyle::Monospace, egui::FontId::new(14.5, egui::FontFamily::Monospace));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Body, egui::FontId::new(14.0, egui::FontFamily::Proportional));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Button, egui::FontId::new(14.0, egui::FontFamily::Proportional));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Small, egui::FontId::new(12.0, egui::FontFamily::Proportional));
-        style.text_styles.insert(
+        // `fn_call_width` у rustfmt по умолчанию 60, поэтому аргументы
+        // записываем вертикально — так файл остаётся стабильным под `cargo fmt`.
+        let ts = &mut style.text_styles;
+        ts.insert(
+            egui::TextStyle::Small,
+            egui::FontId::new(12.0, egui::FontFamily::Proportional),
+        );
+        ts.insert(
+            egui::TextStyle::Body,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        );
+        ts.insert(
+            egui::TextStyle::Button,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        );
+        ts.insert(
             egui::TextStyle::Heading,
             egui::FontId::new(19.0, egui::FontFamily::Proportional),
+        );
+        ts.insert(
+            egui::TextStyle::Monospace,
+            egui::FontId::new(14.5, egui::FontFamily::Monospace),
         );
     });
 }
@@ -700,7 +715,7 @@ impl YoApp {
                     ui.separator();
                     if let Some(path) = &self.current_file {
                         ui.label(
-                            egui::RichText::new(path.to_string_lossy().to_string())
+                            egui::RichText::new(path.to_string_lossy().into_owned())
                                 .small()
                                 .color(COLOR_DIM),
                         );
@@ -751,7 +766,7 @@ impl YoApp {
                     }
                     ui.separator();
                     if ui.button("Сбросить «всегда Е/Ё»").clicked() {
-                        yo_core::clear_user_selections();
+                        clear_user_selections();
                         self.status_left = "память ответов очищена".to_owned();
                         ui.close_menu();
                     }
@@ -761,7 +776,10 @@ impl YoApp {
                     if ui.checkbox(&mut self.dark, "Тёмная тема").clicked() {
                         ui.close_menu();
                     }
-                    if ui.checkbox(&mut self.show_journal, "Журнал замен").clicked() {
+                    if ui
+                        .checkbox(&mut self.show_journal, "Журнал замен")
+                        .clicked()
+                    {
                         ui.close_menu();
                     }
                     ui.separator();
@@ -782,8 +800,9 @@ impl YoApp {
                     }
                 });
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    match &self.dict_info {
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| match &self.dict_info {
                         Some((words, _, rules, _, _)) => {
                             ui.label(
                                 egui::RichText::new(format!("слов: {words} · правил: {rules}"))
@@ -798,8 +817,8 @@ impl YoApp {
                                     .color(COLOR_DIM),
                             );
                         }
-                    }
-                });
+                    },
+                );
             });
         });
     }
@@ -810,13 +829,15 @@ impl YoApp {
             ui.add_space(4.0);
             ui.horizontal_wrapped(|ui| {
                 // ── главная кнопка ──────────────────────────────────────
-                let btn = egui::Button::new(
-                    egui::RichText::new("Ёфицировать").strong().color(COLOR_YO),
-                );
+                let btn =
+                    egui::Button::new(egui::RichText::new("Ёфицировать").strong().color(COLOR_YO));
                 if ui.add_enabled(!self.busy(), btn).clicked() {
                     self.start();
                 }
-                if ui.add_enabled(self.busy(), egui::Button::new("Стоп")).clicked() {
+                if ui
+                    .add_enabled(self.busy(), egui::Button::new("Стоп"))
+                    .clicked()
+                {
                     self.stop();
                 }
                 ui.separator();
@@ -855,7 +876,7 @@ impl YoApp {
                 ui.label("Неоднозначные:");
                 if ui
                     .button(self.opts.ambiguous.label())
-                    .on_hover_text("Что делать со словами, помеченными «?» (нажмите, чтобы переключить)")
+                    .on_hover_text("Слова, помеченные «?»: клик переключает")
                     .clicked()
                 {
                     self.opts.ambiguous = next_policy(self.opts.ambiguous);
@@ -889,7 +910,8 @@ impl YoApp {
                 } else {
                     ui.visuals().widgets.noninteractive.bg_fill
                 };
-                ui.painter().rect_filled(rect, egui::CornerRadius::same(3), c);
+                ui.painter()
+                    .rect_filled(rect, egui::CornerRadius::same(3), c);
 
                 ui.allocate_ui(egui::vec2(right_w, avail.y), |ui| {
                     self.editor_pane(ui, false);
@@ -972,39 +994,39 @@ impl YoApp {
             && self.output.len() <= MAX_HIGHLIGHT_CHARS;
 
         ui.push_id(if is_input { "scroll_in" } else { "scroll_out" }, |ui| {
-        egui::ScrollArea::both()
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                let width = if self.opts.word_wrap {
-                    ui.available_width()
-                } else {
-                    f32::INFINITY
-                };
-                if highlighted {
-                    highlighted_label(ui, &self.output, &self.marks);
-                } else if is_input {
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.input)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(width)
-                            .frame(false)
-                            .hint_text(
-                                "Вставьте текст или загрузите файл (Файл → Загрузить текст…)",
-                            ),
-                    );
-                } else {
-                    let r = ui.add(
-                        egui::TextEdit::multiline(&mut self.output)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_width(width)
-                            .frame(false),
-                    );
-                    if r.changed() {
-                        // Ручная правка результата делает пометки неверными.
-                        self.marks.clear();
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let width = if self.opts.word_wrap {
+                        ui.available_width()
+                    } else {
+                        f32::INFINITY
+                    };
+                    if highlighted {
+                        highlighted_label(ui, &self.output, &self.marks);
+                    } else if is_input {
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.input)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(width)
+                                .frame(false)
+                                .hint_text(
+                                    "Вставьте текст или загрузите файл (Файл → Загрузить текст…)",
+                                ),
+                        );
+                    } else {
+                        let r = ui.add(
+                            egui::TextEdit::multiline(&mut self.output)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_width(width)
+                                .frame(false),
+                        );
+                        if r.changed() {
+                            // Ручная правка результата делает пометки неверными.
+                            self.marks.clear();
+                        }
                     }
-                }
-            });
+                });
         });
     }
 
@@ -1023,7 +1045,11 @@ impl YoApp {
                 ui.add_space(2.0);
 
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new(ask.before.as_str()).monospace().color(COLOR_DIM));
+                    ui.label(
+                        egui::RichText::new(ask.before.as_str())
+                            .monospace()
+                            .color(COLOR_DIM),
+                    );
 
                     let label1 = if ask.focus_first {
                         format!("{} (1)", ask.word1)
@@ -1036,27 +1062,33 @@ impl YoApp {
                         format!("{} (2)", ask.word2)
                     };
                     if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(label1).monospace().strong().color(COLOR_YE),
-                            ),
-                        )
+                        .add(egui::Button::new(
+                            egui::RichText::new(label1)
+                                .monospace()
+                                .strong()
+                                .color(COLOR_YE),
+                        ))
                         .clicked()
                     {
                         self.answer(AskDecision::Ye);
                     }
                     ui.label(egui::RichText::new("/").monospace().color(COLOR_DIM));
                     if ui
-                        .add(
-                            egui::Button::new(
-                                egui::RichText::new(label2).monospace().strong().color(COLOR_YO),
-                            ),
-                        )
+                        .add(egui::Button::new(
+                            egui::RichText::new(label2)
+                                .monospace()
+                                .strong()
+                                .color(COLOR_YO),
+                        ))
                         .clicked()
                     {
                         self.answer(AskDecision::Yo);
                     }
-                    ui.label(egui::RichText::new(ask.after.as_str()).monospace().color(COLOR_DIM));
+                    ui.label(
+                        egui::RichText::new(ask.after.as_str())
+                            .monospace()
+                            .color(COLOR_DIM),
+                    );
                 });
 
                 ui.add_space(4.0);
@@ -1074,12 +1106,21 @@ impl YoApp {
                         self.answer(AskDecision::Cancel);
                     }
                     if ask.wrong_yo {
-                        ui.colored_label(COLOR_MARK, egui::RichText::new("подозрительная «ё»").small());
+                        ui.colored_label(
+                            COLOR_MARK,
+                            egui::RichText::new("подозрительная «ё»").small(),
+                        );
                     } else if ask.replaced_yo {
-                        ui.colored_label(COLOR_MARK, egui::RichText::new("«ё» стоит не там").small());
+                        ui.colored_label(
+                            COLOR_MARK,
+                            egui::RichText::new("«ё» стоит не там").small(),
+                        );
                     }
                     if ask.wrong_ye {
-                        ui.colored_label(COLOR_YE, egui::RichText::new("замена без запроса").small());
+                        ui.colored_label(
+                            COLOR_YE,
+                            egui::RichText::new("замена без запроса").small(),
+                        );
                     }
                 });
 
@@ -1145,11 +1186,11 @@ fn stats_row(ui: &mut egui::Ui, key: &str, value: String) {
 }
 
 /// Следующий вариант политики для неоднозначных слов (кнопка-переключатель).
-fn next_policy(p: yo_core::AmbiguousPolicy) -> yo_core::AmbiguousPolicy {
+fn next_policy(p: AmbiguousPolicy) -> AmbiguousPolicy {
     match p {
-        yo_core::AmbiguousPolicy::Yo => yo_core::AmbiguousPolicy::Ye,
-        yo_core::AmbiguousPolicy::Ye => yo_core::AmbiguousPolicy::Ask,
-        yo_core::AmbiguousPolicy::Ask => yo_core::AmbiguousPolicy::Yo,
+        AmbiguousPolicy::Yo => AmbiguousPolicy::Ye,
+        AmbiguousPolicy::Ye => AmbiguousPolicy::Ask,
+        AmbiguousPolicy::Ask => AmbiguousPolicy::Yo,
     }
 }
 
@@ -1196,6 +1237,7 @@ impl YoApp {
             return;
         }
         let mut open = true;
+        let mut close = false;
         let title = if self.dialog.is_save {
             "Сохранить результат"
         } else {
@@ -1247,41 +1289,41 @@ impl YoApp {
                 // ── список ─────────────────────────────────────────────
                 let entries = self.dialog.entries.clone();
                 ui.push_id("file_list", |ui| {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        for (name, is_dir) in entries {
-                            let label = if is_dir {
-                                format!("[ {} ]", name)
-                            } else {
-                                name.clone()
-                            };
-                            let resp = ui.add(
-                                egui::Button::new(label)
-                                    .frame(false)
-                                    .fill(egui::Color32::TRANSPARENT),
-                            );
-                            if resp.double_clicked() {
-                                if is_dir {
-                                    new_dir = Some(self.dialog.dir.join(&name));
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            for (name, is_dir) in entries {
+                                let label = if is_dir {
+                                    format!("[ {} ]", name)
                                 } else {
-                                    action = Some(if self.dialog.is_save {
-                                        FileAction::Save(
-                                            self.dialog.dir.join(&name),
-                                            self.dialog.encoding,
-                                        )
+                                    name.clone()
+                                };
+                                let resp = ui.add(
+                                    egui::Button::new(label)
+                                        .frame(false)
+                                        .fill(egui::Color32::TRANSPARENT),
+                                );
+                                if resp.double_clicked() {
+                                    if is_dir {
+                                        new_dir = Some(self.dialog.dir.join(&name));
                                     } else {
-                                        FileAction::Load(
-                                            self.dialog.dir.join(&name),
-                                            self.dialog.encoding,
-                                        )
-                                    });
+                                        action = Some(if self.dialog.is_save {
+                                            FileAction::Save(
+                                                self.dialog.dir.join(&name),
+                                                self.dialog.encoding,
+                                            )
+                                        } else {
+                                            FileAction::Load(
+                                                self.dialog.dir.join(&name),
+                                                self.dialog.encoding,
+                                            )
+                                        });
+                                    }
+                                } else if resp.clicked() {
+                                    self.dialog.name = name.clone();
                                 }
-                            } else if resp.clicked() {
-                                self.dialog.name = name.clone();
                             }
-                        }
-                    });
+                        });
                 });
 
                 ui.separator();
@@ -1299,7 +1341,7 @@ impl YoApp {
                         });
                     }
                     if ui.button("Отмена").clicked() {
-                        open = false;
+                        close = true;
                     }
                     if !self.dialog.status.is_empty() {
                         ui.colored_label(COLOR_MARK, self.dialog.status.as_str());
@@ -1307,7 +1349,8 @@ impl YoApp {
                 });
             });
 
-        self.dialog.open = open;
+        // `open` снимается крестиком окна, `close` — кнопкой «Отмена».
+        let mut open = open && !close;
         if let Some(d) = new_dir {
             self.dialog.dir = d;
             self.dialog.refresh();
@@ -1317,7 +1360,7 @@ impl YoApp {
                 FileAction::Load(p, enc) => {
                     if p.is_file() {
                         self.load_path(p, Some(enc));
-                        self.dialog.open = false;
+                        open = false;
                     } else {
                         self.dialog.status = "это не файл".to_owned();
                     }
@@ -1325,13 +1368,14 @@ impl YoApp {
                 FileAction::Save(p, enc) => {
                     if p.parent().map(|x| x.is_dir()).unwrap_or(false) {
                         self.save_path(p, enc);
-                        self.dialog.open = false;
+                        open = false;
                     } else {
                         self.dialog.status = "нет такой папки".to_owned();
                     }
                 }
             }
         }
+        self.dialog.open = open;
     }
 
     fn options_window(&mut self, ctx: &egui::Context) {
@@ -1339,6 +1383,7 @@ impl YoApp {
             return;
         }
         let mut open = true;
+        let mut close = false;
         egui::Window::new("Опции")
             .open(&mut open)
             .resizable(false)
@@ -1346,14 +1391,20 @@ impl YoApp {
             .show(ctx, |ui| {
                 ui.heading("Ёфикация");
                 let o = &mut self.opts;
-                ui.checkbox(&mut o.reg_exprs, "Использование словаря регулярных выражений");
+                ui.checkbox(
+                    &mut o.reg_exprs,
+                    "Использование словаря регулярных выражений",
+                );
                 ui.checkbox(&mut o.no_var_only, "Только безопасные замены");
                 ui.checkbox(&mut o.var_only, "Только интерактивные замены");
                 ui.checkbox(&mut o.check_yo, "Проверять расстановку «ё»");
                 ui.checkbox(&mut o.always_ask, "Всегда подтверждать замену");
                 ui.checkbox(&mut o.to_confirm_abbr, "…подтверждать для сокращений");
                 ui.checkbox(&mut o.to_confirm_cap, "…подтверждать для имён собственных");
-                ui.checkbox(&mut o.to_confirm_ellipsis, "…подтверждать для оборванных слов");
+                ui.checkbox(
+                    &mut o.to_confirm_ellipsis,
+                    "…подтверждать для оборванных слов",
+                );
                 ui.checkbox(&mut o.propose_last, "Предлагать последний вариант замены");
                 ui.checkbox(&mut o.fb_format, "Учитывать формат «FictionBook»");
                 ui.checkbox(&mut o.fast_scroll, "Быстрая прокрутка");
@@ -1365,7 +1416,7 @@ impl YoApp {
                 });
                 ui.horizontal(|ui| {
                     ui.label("Неоднозначные слова:");
-                    for p in yo_core::AmbiguousPolicy::ALL {
+                    for p in AmbiguousPolicy::ALL {
                         ui.radio_value(&mut o.ambiguous, p, p.label());
                     }
                 });
@@ -1385,11 +1436,11 @@ impl YoApp {
                         self.opts = YoOptions::default();
                     }
                     if ui.button("Закрыть").clicked() {
-                        open = false;
+                        close = true;
                     }
                 });
             });
-        self.show_options = open;
+        self.show_options = open && !close;
     }
 
     fn about_window(&mut self, ctx: &egui::Context) {
@@ -1410,7 +1461,7 @@ impl YoApp {
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.heading(egui::RichText::new("YOL — «Ё лайт»").strong());
-                    ui.label(format!("версия {YO_VERSION}"));
+                    ui.label(format!("версия {VERSION}"));
                 });
                 ui.separator();
                 ui.label("Программа для ёфикации русских текстов.");
@@ -1509,11 +1560,15 @@ impl YoApp {
                                 let (from, to) = &self.journal[i];
                                 ui.horizontal(|ui| {
                                     ui.label(
-                                        egui::RichText::new(from.as_str()).monospace().color(COLOR_YE),
+                                        egui::RichText::new(from.as_str())
+                                            .monospace()
+                                            .color(COLOR_YE),
                                     );
                                     ui.label(egui::RichText::new("→").monospace());
                                     ui.label(
-                                        egui::RichText::new(to.as_str()).monospace().color(COLOR_YO),
+                                        egui::RichText::new(to.as_str())
+                                            .monospace()
+                                            .color(COLOR_YO),
                                     );
                                 });
                             }
@@ -1595,13 +1650,20 @@ impl Args {
                 "--word-wrap" => a.opts.word_wrap = true,
                 "--ambiguous" => match it.next() {
                     Some(v) => match v.as_str() {
-                        "yo" | "ё" => a.opts.ambiguous = yo_core::AmbiguousPolicy::Yo,
-                        "ye" | "е" => a.opts.ambiguous = yo_core::AmbiguousPolicy::Ye,
-                        "ask" => a.opts.ambiguous = yo_core::AmbiguousPolicy::Ask,
+                        "yo" | "ё" => a.opts.ambiguous = AmbiguousPolicy::Yo,
+                        "ye" | "е" => a.opts.ambiguous = AmbiguousPolicy::Ye,
+                        "ask" => a.opts.ambiguous = AmbiguousPolicy::Ask,
                         other => a.error = Some(format!("неизвестная политика: {other}")),
                     },
                     None => a.error = Some("не указано значение --ambiguous".into()),
                 },
+                "-" => {
+                    if a.input.is_none() {
+                        a.input = Some(PathBuf::from("-"));
+                    } else {
+                        a.output = Some(PathBuf::from("-"));
+                    }
+                }
                 other => {
                     if other.starts_with('-') {
                         a.error = Some(format!("неизвестный ключ: {other}"));
@@ -1616,9 +1678,16 @@ impl Args {
         a
     }
 
-    /// Консольный режим включается, когда есть что обрабатывать.
+    /// Консольный режим: задан файл ввода/вывода, явно указан `-`
+    /// (stdin/stdout) либо stdin перенаправлен — `cat файл.txt | yol`.
+    ///
+    /// Оговорка: у GUI-приложения, запущенного из .desktop-файла, stdin
+    /// обычно тоже не терминал, поэтому такой запуск нужно помечать `-g`.
     fn is_cli(&self) -> bool {
-        !self.help && !self.version && !self.gui && (self.input.is_some() || self.output.is_some())
+        !self.help
+            && !self.version
+            && !self.gui
+            && (self.input.is_some() || self.output.is_some() || !std::io::stdin().is_terminal())
     }
 }
 
@@ -1672,7 +1741,7 @@ impl<W: std::io::Write> Sink for EncodingSink<W> {
                 other => other,
             }
         };
-        let _ = self.writer.write_all(&yo_core::encode_string(text, enc));
+        let _ = self.writer.write_all(&encode_string(text, enc));
     }
 
     fn stats(&mut self, stats: Stats) {
@@ -1699,29 +1768,36 @@ impl<W: std::io::Write> Sink for EncodingSink<W> {
     }
 }
 
+/// `-` в качестве имени файла означает stdin (на входе) или stdout (на выходе).
+fn is_dash(p: &Path) -> bool {
+    p.as_os_str() == "-"
+}
+
 fn run_cli(args: Args) -> i32 {
-    let data: Vec<u8> = match &args.input {
-        Some(path) => match std::fs::read(path) {
+    let from_stdin = args.input.as_deref().map(is_dash).unwrap_or(true);
+
+    let data: Vec<u8> = if from_stdin {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
+            eprintln!("yol: не удалось прочитать stdin: {e}");
+            return 1;
+        }
+        buf
+    } else {
+        let path = args.input.as_ref().expect("from_stdin == false");
+        match std::fs::read(path) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("yol: не удалось прочитать {}: {e}", path.display());
                 return 1;
             }
-        },
-        None => {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
-                eprintln!("yol: не удалось прочитать stdin: {e}");
-                return 1;
-            }
-            buf
         }
     };
 
     let (text, detected) = match args.in_enc {
         Some(e) => (decode_with(&data, e), e),
-        None => yo_core::decode_bytes(&data),
+        None => decode_bytes(&data),
     };
 
     if !args.quiet {
@@ -1738,10 +1814,23 @@ fn run_cli(args: Args) -> i32 {
         _ => TextEncoding::Utf8Bom,
     });
 
+    let to_stdout = args.output.as_deref().map(is_dash).unwrap_or(true);
+
     let mut engine = Engine::new(args.opts);
     let t0 = Instant::now();
-    let stats = match &args.output {
-        Some(path) => match std::fs::File::create(path) {
+    let stats = match (&args.output, to_stdout) {
+        (_, true) => {
+            let stdout = std::io::stdout();
+            let mut sink = EncodingSink::new(
+                std::io::BufWriter::with_capacity(1 << 20, stdout.lock()),
+                out_enc,
+                args.quiet,
+            );
+            let s = engine.process(&text, &mut sink);
+            let _ = sink.flush();
+            s
+        }
+        (Some(path), false) => match std::fs::File::create(path) {
             Ok(f) => {
                 let mut sink = EncodingSink::new(
                     std::io::BufWriter::with_capacity(1 << 20, f),
@@ -1760,17 +1849,7 @@ fn run_cli(args: Args) -> i32 {
                 return 1;
             }
         },
-        None => {
-            let stdout = std::io::stdout();
-            let mut sink = EncodingSink::new(
-                std::io::BufWriter::with_capacity(1 << 20, stdout.lock()),
-                out_enc,
-                args.quiet,
-            );
-            let s = engine.process(&text, &mut sink);
-            let _ = sink.flush();
-            s
-        }
+        (None, false) => unreachable!("to_stdout == false влечёт Some(path)"),
     };
     let wall = t0.elapsed();
 
@@ -1780,9 +1859,11 @@ fn run_cli(args: Args) -> i32 {
             "yol: готово за {:.2} с · {} замен · {}",
             wall.as_secs_f64(),
             stats.checked_changed,
-            match &args.output {
-                Some(p) => format!("записано в {} ({})", p.display(), out_enc.label()),
-                None => format!("выведено в stdout ({})", out_enc.label()),
+            if to_stdout {
+                format!("выведено в stdout ({})", out_enc.label())
+            } else {
+                let p = args.output.as_deref().unwrap_or(Path::new("-"));
+                format!("записано в {} ({})", p.display(), out_enc.label())
             }
         );
     }
@@ -1797,13 +1878,15 @@ YOL — «Ё лайт»: ёфикация русских текстов
     yol -i файл.txt                результат в stdout
     yol -i файл.txt -o out.txt     файл → файл (потоково, любые объёмы)
     cat файл.txt | yol             чтение из stdin
+    cat файл.txt | yol - -o out    то же явно: «-» = stdin/stdout
 
 КЛЮЧИ
-    -i, --input <файл>        исходный текст
-    -o, --output <файл>       куда писать результат
+    -i, --input <файл>        исходный текст («-» — stdin)
+    -o, --output <файл>       куда писать результат («-» — stdout)
         --in-enc <кодировка>  utf8 | utf8bom | utf16 | utf16be | cp1251 (иначе авто)
         --out-enc <кодировка> кодировка результата
     -g, --gui                 принудительно открыть графический интерфейс
+                              (нужен при запуске из .desktop, где stdin не терминал)
     -q, --quiet               не печатать прогресс
     -h, --help                эта справка
     -V, --version             версия
@@ -1837,7 +1920,7 @@ fn main() -> eframe::Result<()> {
         std::process::exit(2);
     }
     if args.version {
-        println!("yol {YO_VERSION}");
+        println!("yol {VERSION}");
         return Ok(());
     }
     if args.help {
@@ -1868,5 +1951,9 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(APP_NAME, options, Box::new(|cc| Ok(Box::new(YoApp::new(cc)))))
+    eframe::run_native(
+        APP_NAME,
+        options,
+        Box::new(|cc| Ok(Box::new(YoApp::new(cc)))),
+    )
 }

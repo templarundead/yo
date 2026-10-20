@@ -1,2 +1,8 @@
 *.bat
 /target
+# рабочие файлы CI-диагностики
+/body.md
+/build.txt
+/clippy.txt
+/fmt.patch
+/test.txt

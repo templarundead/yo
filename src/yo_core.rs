@@ -307,7 +307,11 @@ pub enum AmbiguousPolicy {
 }
 
 impl AmbiguousPolicy {
-    pub const ALL: [AmbiguousPolicy; 3] = [AmbiguousPolicy::Yo, AmbiguousPolicy::Ye, AmbiguousPolicy::Ask];
+    pub const ALL: [AmbiguousPolicy; 3] = [
+        AmbiguousPolicy::Yo,
+        AmbiguousPolicy::Ye,
+        AmbiguousPolicy::Ask,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
@@ -510,6 +514,7 @@ impl Stats {
 /// Хранит «ё-форму» (`yo`), «е-форму» (`ye`) и заранее посчитанный ключ
 /// поиска `lc = LC(ye)` — поэтому в горячем цикле обращения к словарю не
 /// делают ни одной аллокации и ни одного приведения регистра.
+#[derive(Default)]
 pub struct Dictionary {
     ye: Vec<String>,
     lc: Vec<String>,
@@ -520,20 +525,6 @@ pub struct Dictionary {
     /// `UserSel` — «всегда Е» / «всегда Ё».
     user_sel: Vec<AtomicU8>,
     version: String,
-}
-
-impl Default for Dictionary {
-    fn default() -> Self {
-        Self {
-            ye: Vec::new(),
-            lc: Vec::new(),
-            yo: Vec::new(),
-            ask: Vec::new(),
-            answer: Vec::new(),
-            user_sel: Vec::new(),
-            version: String::new(),
-        }
-    }
 }
 
 impl Dictionary {
@@ -596,7 +587,7 @@ impl Dictionary {
         d
     }
 
-    fn is_sorted(&self) -> bool {
+    pub fn is_sorted(&self) -> bool {
         self.lc
             .windows(2)
             .enumerate()
@@ -626,7 +617,9 @@ impl Dictionary {
         };
         let reorder_u8 = |src: &mut Vec<AtomicU8>| {
             let old = std::mem::take(src);
-            *src = (0..n).map(|i| AtomicU8::new(old[idx(i)].load(AtomicOrdering::Relaxed))).collect();
+            *src = (0..n)
+                .map(|i| AtomicU8::new(old[idx(i)].load(AtomicOrdering::Relaxed)))
+                .collect();
         };
         reorder_strings(&mut self.ye);
         reorder_strings(&mut self.lc);
@@ -723,7 +716,7 @@ impl Dictionary {
     /// (`RestLowerCase`), затем — целиком в нижнем регистре.
     ///
     /// `buf_a`/`buf_b` — переиспользуемые буферы движка.
-    fn find_ul(&self, s: &str, buf_a: &mut String, buf_b: &mut String) -> Option<usize> {
+    pub fn find_ul(&self, s: &str, buf_a: &mut String, buf_b: &mut String) -> Option<usize> {
         // RestLowerCase: первая буква как есть, остальные — в нижний регистр.
         buf_a.clear();
         buf_a.reserve(s.len());
@@ -1204,7 +1197,6 @@ impl Engine {
         };
         let (head, tail) = input.split_at(limit);
 
-        let mut iter = head.char_indices();
         let mut word_start = 0usize;
         let mut word_len = 0usize;
         let mut word_ye_yo = false;
@@ -1212,7 +1204,7 @@ impl Engine {
         let mut counter = 0u64;
         let mut stop_at = head.len();
 
-        while let Some((idx, c)) = iter.next() {
+        for (idx, c) in head.char_indices() {
             if is_alpha(c) {
                 if self.word.is_empty() {
                     word_start = idx;
@@ -1229,7 +1221,9 @@ impl Engine {
 
             if !self.word.is_empty() {
                 let word = std::mem::take(&mut self.word);
-                let undo = self.handle_word(&word, word_start, idx, c, word_len, word_ye_yo, word_yo, input, sink);
+                let undo = self.handle_word(
+                    &word, word_start, idx, c, word_len, word_ye_yo, word_yo, input, sink,
+                );
                 self.word = word;
                 self.word.clear();
                 self.stats.words += 1;
@@ -1255,7 +1249,17 @@ impl Engine {
         if stop_at >= head.len() && !self.word.is_empty() {
             // Последнее слово в проверяемой части текста.
             let word = std::mem::take(&mut self.word);
-            self.handle_word(&word, word_start, head.len(), '\n', word_len, word_ye_yo, word_yo, input, sink);
+            self.handle_word(
+                &word,
+                word_start,
+                head.len(),
+                '\n',
+                word_len,
+                word_ye_yo,
+                word_yo,
+                input,
+                sink,
+            );
             self.word = word;
             self.word.clear();
             self.stats.words += 1;
@@ -1329,6 +1333,11 @@ impl Engine {
         if sel.cancel {
             // «Прервать» (и «Откат», который тоже останавливает прогон):
             // слово остаётся без изменений, обработка прекращается.
+            // Вопрос к этому моменту уже задан — учитываем его в статистике.
+            if sel.asked {
+                self.stats.asked += 1;
+                self.stats.asked_not_changed += 1;
+            }
             self.out.push_str(word);
             if sel.undo {
                 self.apply_undo(sink);
@@ -1373,7 +1382,8 @@ impl Engine {
             let old_ch = old_chars.next();
             let len = new_ch.len_utf8();
             if Some(new_ch) != old_ch && self.opts.mark && self.marks.len() < MAX_MARKS {
-                self.marks.push((offset + byte_off, offset + byte_off + len));
+                self.marks
+                    .push((offset + byte_off, offset + byte_off + len));
             }
             result.push(new_ch);
             byte_off += len;
@@ -1406,7 +1416,8 @@ impl Engine {
         let base = self.emitted;
         if offset >= base {
             let rel = offset - base;
-            if rel + new.len() <= self.out.len() && &self.out[rel..rel + new.len()] == new.as_str() {
+            if rel + new.len() <= self.out.len() && &self.out[rel..rel + new.len()] == new.as_str()
+            {
                 self.out.replace_range(rel..rel + new.len(), &old);
                 self.marks
                     .retain(|&(s, _)| !(s >= offset && s < offset + new.len()));
@@ -1441,19 +1452,20 @@ impl Engine {
         to_ye_into(c_word, &mut self.b_word1);
 
         // FindReplacement
-        let (dic_index, mut to_ask, mut focus, always) = match dic.find_ul(&self.b_word1, &mut self.b_key, &mut self.b_lc) {
-            Some(i) => {
-                sel.dic_index = Some(i);
-                let remembered = dic.user_sel(i);
-                if remembered != 0 {
-                    (Some(i), false, remembered, true)
-                } else {
-                    let ask = dic.ask(i);
-                    (Some(i), ask, if ask { dic.answer(i) } else { 2 }, false)
+        let (dic_index, mut to_ask, mut focus, always) =
+            match dic.find_ul(&self.b_word1, &mut self.b_key, &mut self.b_lc) {
+                Some(i) => {
+                    sel.dic_index = Some(i);
+                    let remembered = dic.user_sel(i);
+                    if remembered != 0 {
+                        (Some(i), false, remembered, true)
+                    } else {
+                        let ask = dic.ask(i);
+                        (Some(i), ask, if ask { dic.answer(i) } else { 2 }, false)
+                    }
                 }
-            }
-            None => (None, false, 1u8, false),
-        };
+                None => (None, false, 1u8, false),
+            };
         let has_w2 = dic_index.is_some();
 
         self.b_word2.clear();
@@ -1466,14 +1478,15 @@ impl Engine {
             && self.opts.to_confirm_abbr
             && terminator == '.'
             && is_abbreviation_at(input, word_end + terminator.len_utf8());
-        let to_check_ell = has_w2 && self.opts.to_confirm_ellipsis && is_ellipsis_at(input, word_end);
+        let to_check_ell =
+            has_w2 && self.opts.to_confirm_ellipsis && is_ellipsis_at(input, word_end);
 
         to_ask = to_ask
             || (has_w2 && to_check_abbr)
             || (has_w2 && to_check_ell)
             || (has_w2
                 && self.opts.to_confirm_cap
-                && c_word.chars().next().map_or(false, is_upper)
+                && c_word.chars().next().is_some_and(is_upper)
                 && !always);
 
         let is_yo_c_word = is_yo_in(c_word);
@@ -1588,9 +1601,11 @@ impl Engine {
                     }
                     AskDecision::Cancel => sel.cancel = true,
                 }
-                if let Some(i) = dic_index {
-                    if focus > 0 && focus < 3 {
-                        dic.set_answer(i, focus);
+                if !sel.cancel {
+                    if let Some(i) = dic_index {
+                        if focus > 0 && focus < 3 {
+                            dic.set_answer(i, focus);
+                        }
                     }
                 }
             } else {
@@ -1642,27 +1657,19 @@ impl Engine {
         let mut it = input[..word_start].char_indices().rev();
         let mut to_cut = false;
         for n in 1..=CONTEXT_WORDS {
-            loop {
-                match it.next() {
-                    Some((_, c)) => {
-                        pre.push(c);
-                        if is_alpha(c) {
-                            break;
-                        }
-                    }
-                    None => break,
+            // Разделитель перед очередным словом контекста.
+            for (_, c) in it.by_ref() {
+                pre.push(c);
+                if is_alpha(c) {
+                    break;
                 }
             }
-            loop {
-                match it.next() {
-                    Some((_, c)) => {
-                        pre.push(c);
-                        if !is_alpha(c) {
-                            to_cut = n == CONTEXT_WORDS;
-                            break;
-                        }
-                    }
-                    None => break,
+            // Само слово — до ближайшего разделителя.
+            for (_, c) in it.by_ref() {
+                pre.push(c);
+                if !is_alpha(c) {
+                    to_cut = n == CONTEXT_WORDS;
+                    break;
                 }
             }
         }
@@ -1682,27 +1689,19 @@ impl Engine {
         let mut it = input[word_end..].char_indices();
         let mut to_cut = false;
         for n in 1..=CONTEXT_WORDS {
-            loop {
-                match it.next() {
-                    Some((_, c)) => {
-                        post.push(c);
-                        if is_alpha(c) {
-                            break;
-                        }
-                    }
-                    None => break,
+            // Разделитель перед очередным словом контекста.
+            for (_, c) in it.by_ref() {
+                post.push(c);
+                if is_alpha(c) {
+                    break;
                 }
             }
-            loop {
-                match it.next() {
-                    Some((_, c)) => {
-                        post.push(c);
-                        if !is_alpha(c) {
-                            to_cut = n == CONTEXT_WORDS;
-                            break;
-                        }
-                    }
-                    None => break,
+            // Само слово — до ближайшего разделителя.
+            for (_, c) in it.by_ref() {
+                post.push(c);
+                if !is_alpha(c) {
+                    to_cut = n == CONTEXT_WORDS;
+                    break;
                 }
             }
         }
@@ -1744,7 +1743,9 @@ pub fn match_regexp(
         for gi in 1..caps.len() {
             let Some(m) = caps.get(gi) else { continue };
             let (s, e) = (m.start(), m.end());
-            let Some(slice) = context.get(s..e) else { continue };
+            let Some(slice) = context.get(s..e) else {
+                continue;
+            };
             let mut slice_chars = slice.chars();
             let first = match slice_chars.next() {
                 Some(c) => c,
@@ -1766,7 +1767,7 @@ pub fn match_regexp(
                 }
             }
             j += 1;
-            if ci >= di && ci <= di + w_len - 1 {
+            if ci >= di && ci < di + w_len {
                 is_new_word = true;
             }
         }
@@ -1966,7 +1967,9 @@ mod tests {
 
     fn run(input: &str, opts: YoOptions) -> (String, Stats) {
         let mut engine = Engine::new(opts);
-        let mut sink = Collector { text: String::new() };
+        let mut sink = Collector {
+            text: String::new(),
+        };
         let stats = engine.process(input, &mut sink);
         (sink.text, stats)
     }
@@ -2002,8 +2005,10 @@ mod tests {
 
     #[test]
     fn check_yo_off_keeps_yo() {
-        let mut o = YoOptions::default();
-        o.check_yo = false;
+        let o = YoOptions {
+            check_yo: false,
+            ..Default::default()
+        };
         let (out, _) = run("ёлка елка", o);
         assert_eq!(out, "ёлка ёлка");
     }
@@ -2027,7 +2032,11 @@ mod tests {
     fn regexp_dictionary_is_compiled() {
         let r = regex_dictionary();
         assert!(r.len() > 50, "правил слишком мало: {}", r.len());
-        assert!(r.invalid().is_empty(), "не скомпилировалось: {:?}", r.invalid());
+        assert!(
+            r.invalid().is_empty(),
+            "не скомпилировалось: {:?}",
+            r.invalid()
+        );
     }
 
     #[test]

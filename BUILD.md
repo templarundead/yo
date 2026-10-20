@@ -295,7 +295,14 @@ cargo build --release --target $(uname -m)-apple-darwin
 ## 7. Тесты и бенчмарк
 
 ```bash
-cargo test --release
+cargo test --all              # юнит-тесты + интеграционные (tests/) + док-тесты
+cargo test --release --all    # то же в release — цифры ближе к боевым
+
+# только интеграционные тесты
+cargo test --test yofication
+cargo test --test dictionary
+cargo test --test encoding
+cargo test --test cli
 
 # прикидка скорости на большом файле
 head -c 100000000 /dev/urandom | base64 > /tmp/big.txt   # 100 МБ
@@ -308,6 +315,22 @@ head -c 100000000 /dev/urandom | base64 > /tmp/big.txt   # 100 МБ
 ./target/release/yol --version      # консольный путь, без GUI
 cargo test --release -- --nocapture dictionary_is_loaded_and_sorted
 ```
+
+> Интеграционные тесты из `tests/` работают с **библиотекой** `yol`
+> (`src/lib.rs`), поэтому ядро обязано оставаться библиотечной целью:
+> если вынести `mod yo_core` обратно в `main.rs`, `use yol::yo_core::…`
+> в `tests/` перестанет собираться.
+
+### Линт и форматирование перед пушем
+
+```bash
+cargo fmt --all
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all
+```
+
+Ровно это делает Stage 1 пайплайна, поэтому локальный прогон экономит
+круг CI. См. `.github/workflows/ci.yml`.
 
 ---
 
