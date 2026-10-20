@@ -1333,6 +1333,11 @@ impl Engine {
         if sel.cancel {
             // «Прервать» (и «Откат», который тоже останавливает прогон):
             // слово остаётся без изменений, обработка прекращается.
+            // Вопрос к этому моменту уже задан — учитываем его в статистике.
+            if sel.asked {
+                self.stats.asked += 1;
+                self.stats.asked_not_changed += 1;
+            }
             self.out.push_str(word);
             if sel.undo {
                 self.apply_undo(sink);
@@ -1596,9 +1601,11 @@ impl Engine {
                     }
                     AskDecision::Cancel => sel.cancel = true,
                 }
-                if let Some(i) = dic_index {
-                    if focus > 0 && focus < 3 {
-                        dic.set_answer(i, focus);
+                if !sel.cancel {
+                    if let Some(i) = dic_index {
+                        if focus > 0 && focus < 3 {
+                            dic.set_answer(i, focus);
+                        }
                     }
                 }
             } else {

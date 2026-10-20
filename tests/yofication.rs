@@ -334,7 +334,10 @@ fn regexp_rule_resolves_an_ambiguous_word() {
 
 #[test]
 fn fb2_binary_tail_is_not_touched() {
-    let src = "Актер вышел.\n<binary id=\"cover.jpg\">base64елкаелка</binary>\n";
+    // NB: латиница и цифры в оригинале — разделители слов, поэтому хвост
+    // вида «base64елкаелка» не ёфицируется и без fb2-режима: «елкаелка»
+    // в словаре нет. Проверяем на слове, отделённом пробелом.
+    let src = "Актер вышел.\n<binary id=\"cover.jpg\">base64ZWxrYQ==</binary>\nелка\n";
 
     let with_fb = yofy_with(src, |o| o.fb_format = true);
     let without_fb = yofy_with(src, |o| o.fb_format = false);
@@ -344,11 +347,11 @@ fn fb2_binary_tail_is_not_touched() {
         "до <binary> текст ёфицируется: {with_fb:?}"
     );
     assert!(
-        with_fb.contains("base64елкаелка"),
+        with_fb.ends_with("\nелка\n"),
         "после <binary> текст не должен меняться: {with_fb:?}"
     );
     assert!(
-        without_fb.contains("base64ёлкаёлка"),
+        without_fb.ends_with("\nёлка\n"),
         "без fb2-режима хвост ёфицируется: {without_fb:?}"
     );
 }
@@ -361,8 +364,10 @@ fn fb2_binary_tail_is_not_touched() {
 fn stats_count_what_the_gui_shows() {
     let src = "Актер вышел на сцену.";
     let (_, s) = process(src, YoOptions::default());
+    // Слова с е/ё длиннее одного символа: «Актер», «вышел», «сцену».
+    assert_eq!(s.checked, 3);
     assert_eq!(s.checked_changed, 1);
-    assert_eq!(s.checked_not_changed, 0);
+    assert_eq!(s.checked_not_changed, 2); // «вышел» и «сцену» в базе нет
     assert_eq!(s.e_to_yo, 1);
     assert_eq!(s.yo_to_e, 0);
     assert_eq!(s.chars, src.chars().count() as u64);
@@ -436,10 +441,9 @@ fn cancellation_stops_early_but_keeps_the_text_consistent() {
     let stats = engine.process(&src, &mut sink);
 
     assert!(
-        stats.chars < src.chars().count() as u64,
-        "после отмены обработано не всё: {} из {}",
-        stats.chars,
-        src.chars().count()
+        stats.words < 80_000,
+        "после отмены обработано не всё: {} слов из 80 000",
+        stats.words
     );
     // Длина всё равно совпадает: необработанный хвост дописывается как есть.
     assert_eq!(sink.text.chars().count(), src.chars().count());
