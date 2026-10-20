@@ -290,6 +290,19 @@ cargo build --release --target $(uname -m)-apple-darwin
 
 Все профили наследуют `strip`/`debug` из `release` (кроме `release-lite`).
 
+### Рендереры (фичи)
+
+| Команда | Рендереры | Размер (linux-gnu, release) |
+|---|---|---|
+| `cargo build --release` | OpenGL + WGPU | 15.3 МБ (15 265 760 Б) |
+| `cargo build --release --no-default-features` | только OpenGL | 11.9 МБ (11 857 728 Б) |
+
+WGPU подключается фичей `renderer-wgpu` (включена по умолчанию) — это
+Vulkan/Metal/DX12, и он же выбран рендерером по умолчанию. На машинах без
+Vulkan (например, часть ARM-плат) разумнее собрать вообще без WGPU:
+OpenGL-бэкенд `glow` включён фичами eframe по умолчанию и никуда не
+исчезает, поэтому `YOL_RENDERER=glow` работает в любой сборке.
+
 ---
 
 ## 7. Тесты и бенчмарк

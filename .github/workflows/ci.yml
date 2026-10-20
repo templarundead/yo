@@ -91,6 +91,15 @@ jobs:
       - name: Run tests (release — реальные цифры производительности)
         run: cargo test --release --all
 
+      # WGPU — единственная опциональная фича. Если её отключить, `main.rs`
+      # обязан собраться и без `eframe::Renderer::Wgpu`, поэтому проверяем
+      # обе конфигурации — иначе фича сгниёт незамеченной.
+      - name: Check feature combinations
+        run: |
+          cargo check --all-targets                        # OpenGL + WGPU
+          cargo clippy --all-targets -- -D warnings        # то же, с линтером
+          cargo check --all-targets --no-default-features  # только OpenGL
+
   # ═══════════════════════════════════════════════════════════════════════════
   #  STAGE 2 — релизные бинарники
   # ═══════════════════════════════════════════════════════════════════════════

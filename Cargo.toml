@@ -43,9 +43,10 @@ path = "src/main.rs"
 # Immediate-mode GUI. Pinned on purpose: the egui API moves fast and every
 # widget used here is verified against the 0.31 line.
 egui = "0.31"
-# `glow` (OpenGL) включён по умолчанию; добавляем `wgpu` — тогда eframe по
-# умолчанию использует WGPU, а `YOL_RENDERER=glow` переключает на OpenGL.
-eframe = { version = "0.31", features = ["wgpu"] }
+# `glow` (OpenGL) включён фичами eframe по умолчанию; WGPU подключаем своей
+# фичей — тогда eframe по умолчанию использует WGPU, а `YOL_RENDERER=glow`
+# переключает на OpenGL.
+eframe = { version = "0.31" }
 
 # High-performance regular expressions for the "yo_regexpr.dat" rule database.
 # `perf` keeps the DFA/literal prefilters (big win on the ~94 rule set),
@@ -58,6 +59,20 @@ regex = { version = "1", default-features = false, features = [
     "unicode-gencat",
     "unicode-script",
 ] }
+
+# ---------------------------------------------------------------------------
+#  Features — позволяют собрать бинарник без WGPU (только OpenGL).
+# ---------------------------------------------------------------------------
+
+[features]
+default = ["renderer-wgpu"]
+
+## WGPU-бэкенд (Vulkan / Metal / DX12) — рендерер по умолчанию.
+## Отключите его, чтобы оставить один OpenGL и сэкономить ~4 МБ:
+##   cargo build --release --no-default-features
+## OpenGL (`glow`) при этом остаётся: он включён фичами eframe по умолчанию,
+## поэтому `YOL_RENDERER=glow` работает в любой сборке.
+renderer-wgpu = ["eframe/wgpu"]
 
 # ---------------------------------------------------------------------------
 #  Release profile — max speed, single codegen unit, full LTO, no debug info.
