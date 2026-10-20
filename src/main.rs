@@ -1911,6 +1911,20 @@ YOL — «Ё лайт»: ёфикация русских текстов
 //  Точка входа
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Рендерер по умолчанию: WGPU, если он собран, иначе OpenGL.
+///
+/// Сборка без WGPU (`cargo build --no-default-features`) даёт бинарник
+/// примерно на 4 МБ меньше — на машинах без Vulkan это самый разумный выбор.
+#[cfg(feature = "renderer-wgpu")]
+fn default_renderer() -> eframe::Renderer {
+    eframe::Renderer::Wgpu
+}
+
+#[cfg(not(feature = "renderer-wgpu"))]
+fn default_renderer() -> eframe::Renderer {
+    eframe::Renderer::Glow
+}
+
 fn main() -> eframe::Result<()> {
     let args = Args::parse(std::env::args());
 
@@ -1935,7 +1949,7 @@ fn main() -> eframe::Result<()> {
     //   YOL_RENDERER=glow ./yol
     let renderer = match std::env::var("YOL_RENDERER").as_deref() {
         Ok("glow") | Ok("gl") | Ok("opengl") => eframe::Renderer::Glow,
-        _ => eframe::Renderer::Wgpu,
+        _ => default_renderer(),
     };
 
     let options = eframe::NativeOptions {

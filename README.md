@@ -215,9 +215,17 @@ Cargo.toml        — профиль release: lto=true, opt-level=3, codegen-uni
 
 ### Размер бинарника
 
-Честно: реалистичная цифра для GUI-приложения на egui — **8–15 МБ**
-(из них ~1.8 МБ — встроенный словарь), а не 3–5 МБ: тёмная тема, WGPU,
-winit и сам egui весят существенно. Что сделано для уменьшения:
+Заявленные 3–5 МБ не достигаются: egui + winit + рендереры весят существенно.
+Замер release-сборки под `x86_64-unknown-linux-gnu` (`lto = true`,
+`opt-level = 3`, `codegen-units = 1`, `panic = "abort"`, `strip = true`):
+
+| конфигурация | размер |
+|---|---|
+| по умолчанию: OpenGL + WGPU | **15.3 МБ** (15 265 760 Б) |
+| `--no-default-features` — только OpenGL | **11.9 МБ** (11 857 728 Б) |
+
+Из 15.3 МБ: `.text` — 9.5 МБ, `.rodata` — 4.2 МБ (в том числе 1.8 МБ
+встроенного `yox.dat`). Что сделано для уменьшения:
 
 * `lto = true`, `codegen-units = 1`, `panic = "abort"`, `strip = true`;
 * у `regex` отключены ненужные фичи (`unicode-age`, `unicode-bool`,
@@ -226,8 +234,14 @@ winit и сам egui весят существенно. Что сделано д
 * ни одного «тяжёлого» зависимого крейта: нет GTK, нет rfd, нет image-декодеров.
 
 ```bash
-cargo build --profile minimum   # самый компактный бинарник
+cargo build --profile minimum               # самый компактный бинарник
+cargo build --release --no-default-features # без WGPU: −4 МБ, только OpenGL
 ```
+
+WGPU — единственная опциональная фича (`renderer-wgpu`, включена по
+умолчанию). Без неё приложение рисует через OpenGL, `YOL_RENDERER=glow`
+продолжает работать в любой сборке, а `--profile minimum` и
+`--no-default-features` можно сочетать.
 
 ## Состав репозитория
 
