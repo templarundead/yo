@@ -220,6 +220,32 @@ fn stdin_to_stdout_is_yofied() {
     assert_eq!(text, "Актёр и ёлка");
 }
 
+#[test]
+fn dash_means_stdin_and_stdout() {
+    let mut child = yol()
+        .args(["-q", "--out-enc", "utf8", "-", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("не запустился");
+
+    child
+        .stdin
+        .as_mut()
+        .expect("stdin")
+        .write_all("елка".as_bytes())
+        .expect("запись в stdin");
+
+    let out = child.wait_with_output().expect("ожидание");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(String::from_utf8(out.stdout).expect("stdout не в UTF-8"), "ёлка");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Настройки ёфикации из командной строки
 // ─────────────────────────────────────────────────────────────────────────────

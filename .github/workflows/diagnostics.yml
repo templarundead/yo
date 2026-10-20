@@ -102,7 +102,7 @@ jobs:
         id: test
         run: |
           set +e
-          cargo test --all 2>&1 \
+          cargo test --all --no-fail-fast 2>&1 \
             | grep -E 'test result|panicked at|^---- |^error|FAILED|^failures:|Running|Doc-tests' \
             | head -120 > test.txt
           echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"

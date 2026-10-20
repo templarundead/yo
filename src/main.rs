@@ -18,6 +18,7 @@
 //! по 64 КБ, статистика — примерно 15 раз в секунду. Поэтому интерфейс не
 //! «фризится» даже на стомегабайтных файлах.
 
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -1656,6 +1657,13 @@ impl Args {
                     },
                     None => a.error = Some("не указано значение --ambiguous".into()),
                 },
+                "-" => {
+                    if a.input.is_none() {
+                        a.input = Some(PathBuf::from("-"));
+                    } else {
+                        a.output = Some(PathBuf::from("-"));
+                    }
+                }
                 other => {
                     if other.starts_with('-') {
                         a.error = Some(format!("неизвестный ключ: {other}"));
@@ -1670,9 +1678,18 @@ impl Args {
         a
     }
 
-    /// Консольный режим включается, когда есть что обрабатывать.
+    /// Консольный режим: задан файл ввода/вывода, явно указан `-`
+    /// (stdin/stdout) либо stdin перенаправлен — `cat файл.txt | yol`.
+    ///
+    /// Оговорка: у GUI-приложения, запущенного из .desktop-файла, stdin
+    /// обычно тоже не терминал, поэтому такой запуск нужно помечать `-g`.
     fn is_cli(&self) -> bool {
-        !self.help && !self.version && !self.gui && (self.input.is_some() || self.output.is_some())
+        !self.help
+            && !self.version
+            && !self.gui
+            && (self.input.is_some()
+                || self.output.is_some()
+                || !std::io::stdin().is_terminal())
     }
 }
 
@@ -1753,23 +1770,30 @@ impl<W: std::io::Write> Sink for EncodingSink<W> {
     }
 }
 
+/// `-` в качестве имени файла означает stdin (на входе) или stdout (на выходе).
+fn is_dash(p: &Path) -> bool {
+    p.as_os_str() == "-"
+}
+
 fn run_cli(args: Args) -> i32 {
-    let data: Vec<u8> = match &args.input {
-        Some(path) => match std::fs::read(path) {
+    let from_stdin = args.input.as_deref().map(is_dash).unwrap_or(true);
+
+    let data: Vec<u8> = if from_stdin {
+        use std::io::Read;
+        let mut buf = Vec::new();
+        if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
+            eprintln!("yol: не удалось прочитать stdin: {e}");
+            return 1;
+        }
+        buf
+    } else {
+        let path = args.input.as_ref().expect("from_stdin == false");
+        match std::fs::read(path) {
             Ok(d) => d,
             Err(e) => {
                 eprintln!("yol: не удалось прочитать {}: {e}", path.display());
                 return 1;
             }
-        },
-        None => {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            if let Err(e) = std::io::stdin().read_to_end(&mut buf) {
-                eprintln!("yol: не удалось прочитать stdin: {e}");
-                return 1;
-            }
-            buf
         }
     };
 
@@ -1792,10 +1816,23 @@ fn run_cli(args: Args) -> i32 {
         _ => TextEncoding::Utf8Bom,
     });
 
+    let to_stdout = args.output.as_deref().map(is_dash).unwrap_or(true);
+
     let mut engine = Engine::new(args.opts);
     let t0 = Instant::now();
-    let stats = match &args.output {
-        Some(path) => match std::fs::File::create(path) {
+    let stats = match (&args.output, to_stdout) {
+        (_, true) => {
+            let stdout = std::io::stdout();
+            let mut sink = EncodingSink::new(
+                std::io::BufWriter::with_capacity(1 << 20, stdout.lock()),
+                out_enc,
+                args.quiet,
+            );
+            let s = engine.process(&text, &mut sink);
+            let _ = sink.flush();
+            s
+        }
+        (Some(path), false) => match std::fs::File::create(path) {
             Ok(f) => {
                 let mut sink = EncodingSink::new(
                     std::io::BufWriter::with_capacity(1 << 20, f),
@@ -1814,17 +1851,7 @@ fn run_cli(args: Args) -> i32 {
                 return 1;
             }
         },
-        None => {
-            let stdout = std::io::stdout();
-            let mut sink = EncodingSink::new(
-                std::io::BufWriter::with_capacity(1 << 20, stdout.lock()),
-                out_enc,
-                args.quiet,
-            );
-            let s = engine.process(&text, &mut sink);
-            let _ = sink.flush();
-            s
-        }
+        (None, false) => unreachable!("to_stdout == false влечёт Some(path)"),
     };
     let wall = t0.elapsed();
 
@@ -1834,9 +1861,11 @@ fn run_cli(args: Args) -> i32 {
             "yol: готово за {:.2} с · {} замен · {}",
             wall.as_secs_f64(),
             stats.checked_changed,
-            match &args.output {
-                Some(p) => format!("записано в {} ({})", p.display(), out_enc.label()),
-                None => format!("выведено в stdout ({})", out_enc.label()),
+            if to_stdout {
+                format!("выведено в stdout ({})", out_enc.label())
+            } else {
+                let p = args.output.as_deref().unwrap_or(Path::new("-"));
+                format!("записано в {} ({})", p.display(), out_enc.label())
             }
         );
     }
@@ -1851,13 +1880,15 @@ YOL — «Ё лайт»: ёфикация русских текстов
     yol -i файл.txt                результат в stdout
     yol -i файл.txt -o out.txt     файл → файл (потоково, любые объёмы)
     cat файл.txt | yol             чтение из stdin
+    cat файл.txt | yol - -o out    то же явно: «-» = stdin/stdout
 
 КЛЮЧИ
-    -i, --input <файл>        исходный текст
-    -o, --output <файл>       куда писать результат
+    -i, --input <файл>        исходный текст («-» — stdin)
+    -o, --output <файл>       куда писать результат («-» — stdout)
         --in-enc <кодировка>  utf8 | utf8bom | utf16 | utf16be | cp1251 (иначе авто)
         --out-enc <кодировка> кодировка результата
     -g, --gui                 принудительно открыть графический интерфейс
+                              (нужен при запуске из .desktop, где stdin не терминал)
     -q, --quiet               не печатать прогресс
     -h, --help                эта справка
     -V, --version             версия
