@@ -313,22 +313,22 @@ fn ambiguous_policy_decides_without_asking() {
 #[test]
 fn regexp_rule_resolves_an_ambiguous_word() {
     let mut o = opts(|o| o.ambiguous = AmbiguousPolicy::Ye);
-    let with = process("все время", o.clone());
+    let (with_sink, with) = process("все время", o.clone());
 
     o.reg_exprs = false;
-    let without = process("все время", o);
+    let (without_sink, without) = process("все время", o);
 
     assert!(
-        with.stats.re > 0,
+        with.re > 0,
         "правило «всё время» должно сработать — иначе порт MatchRegExp сломан"
     );
-    assert_eq!(with.text, "всё время");
+    assert_eq!(with_sink.text, "всё время");
     assert_eq!(
-        without.stats.re, 0,
+        without.re, 0,
         "с выключенными правилами их быть не должно"
     );
-    assert_eq!(without.stats.no_re, 0);
-    assert_eq!(without.text, "все время");
+    assert_eq!(without.no_re, 0);
+    assert_eq!(without_sink.text, "все время");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

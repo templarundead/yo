@@ -119,7 +119,11 @@ jobs:
           BUILD_EXIT: ${{ steps.build.outputs.exit }}
           TEST_EXIT: ${{ steps.test.outputs.exit }}
         run: |
-          trim() { if [ -s "$1" ]; then head -c "$2" "$1"; echo; echo "… (обрезано)"; else echo "(пусто)"; fi; }
+          trim() {
+            if [ ! -s "$1" ]; then echo "(пусто)"; return; fi
+            if [ "$(wc -c < "$1")" -gt "$2" ]; then head -c "$2" "$1"; echo; echo "… (обрезано)"
+            else cat "$1"; fi
+          }
           {
             echo "## Диагностика CI (временный workflow)"
             echo
