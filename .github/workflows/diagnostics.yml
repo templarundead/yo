@@ -12,8 +12,17 @@
 
 name: Diagnostics (temporary)
 
+# NB: `workflow_dispatch` резолвится по файлам на дефолтной ветке, поэтому
+# из ветки разработки его не дёрнуть. Push-триггер берёт workflow из самой
+# ветки — ровно то, что нужно.
 on:
   workflow_dispatch:
+  push:
+    branches: ["arena/**"]
+
+concurrency:
+  group: diagnostics-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: write
