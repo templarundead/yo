@@ -1,0 +1,87 @@
+# ============================================================================
+#  YOL ("Ё лайт") — modern Rust / egui rewrite of the legacy Delphi 7 tool.
+#
+#  The dictionary databases (`assets/yox.dat`, `assets/yo_regexpr.dat`) are
+#  baked straight into the executable with `include_bytes!`, therefore the
+#  produced binary is fully self-contained: no installation, no data files.
+# ============================================================================
+
+[package]
+name = "yol"
+version = "0.9.84"
+edition = "2021"
+rust-version = "1.76"
+authors = ["YOL contributors"]
+description = "YOL (\"Ё лайт\") — ёфикация русских текстов: словарь + регулярные выражения, GUI на egui"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/templarundead/yo"
+readme = "README.md"
+keywords = ["yo", "yofication", "cyrillic", "egui", "text"]
+categories = ["text-processing", "gui"]
+# В пакет не попадает ничего лишнего: ни исходники Delphi-оригинала,
+# ни готовый yol.exe, ни картинки.
+exclude = ["binary/*", "images/*", "legacy/*"]
+build = "build.rs"
+
+[[bin]]
+name = "yol"
+path = "src/main.rs"
+
+# ---------------------------------------------------------------------------
+#  Dependencies — deliberately tiny: GUI + regexes only.
+# ---------------------------------------------------------------------------
+
+[dependencies]
+# Immediate-mode GUI. Pinned on purpose: the egui API moves fast and every
+# widget used here is verified against the 0.31 line.
+egui = "0.31"
+# `glow` (OpenGL) включён по умолчанию; добавляем `wgpu` — тогда eframe по
+# умолчанию использует WGPU, а `YOL_RENDERER=glow` переключает на OpenGL.
+eframe = { version = "0.31", features = ["wgpu"] }
+
+# High-performance regular expressions for the "yo_regexpr.dat" rule database.
+# `perf` keeps the DFA/literal prefilters (big win on the ~94 rule set),
+# `unicode-perl` gives us \b \w \d \s with Cyrillic-aware semantics.
+regex = { version = "1", default-features = false, features = [
+    "std",
+    "perf",
+    "unicode-perl",
+    "unicode-case",
+    "unicode-gencat",
+    "unicode-script",
+] }
+
+# ---------------------------------------------------------------------------
+#  Release profile — max speed, single codegen unit, full LTO, no debug info.
+# ---------------------------------------------------------------------------
+
+[profile.release]
+opt-level = 3        # maximum optimisation
+lto = true           # fat LTO across all crates (slower link, fastest code)
+codegen-units = 1    # one CGU ⇒ best inlining, smallest binary
+panic = "abort"      # no unwinding tables (~15 % smaller binary)
+strip = true         # drop symbols
+debug = false
+debug-assertions = false
+overflow-checks = false
+incremental = false
+rpath = false
+
+# Handy when you want a debuggable optimised build:
+#   cargo build --profile release-lite
+[profile.release-lite]
+inherits = "release"
+lto = "thin"
+codegen-units = 4
+panic = "unwind"
+strip = "debuginfo"
+debug = true
+
+# `cargo build --profile minimum` — smallest possible binary (size first).
+[profile.minimum]
+inherits = "release"
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
