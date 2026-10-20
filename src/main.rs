@@ -1687,9 +1687,7 @@ impl Args {
         !self.help
             && !self.version
             && !self.gui
-            && (self.input.is_some()
-                || self.output.is_some()
-                || !std::io::stdin().is_terminal())
+            && (self.input.is_some() || self.output.is_some() || !std::io::stdin().is_terminal())
     }
 }
 

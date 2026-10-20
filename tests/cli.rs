@@ -243,7 +243,10 @@ fn dash_means_stdin_and_stdout() {
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert_eq!(String::from_utf8(out.stdout).expect("stdout не в UTF-8"), "ёлка");
+    assert_eq!(
+        String::from_utf8(out.stdout).expect("stdout не в UTF-8"),
+        "ёлка"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

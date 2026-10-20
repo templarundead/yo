@@ -1,22 +1,33 @@
 ## Диагностика CI (временный workflow)
 
-- ветка: `arena/7f855ed5-yo`, коммит: `d2ef577`
+- ветка: `arena/7f855ed5-yo`, коммит: `9bb30c0`
 - fmt: `1` · clippy: `0` · build: `0` · test: `101`
 
 ### cargo fmt --all -- --check
 ```diff
-Diff in /home/runner/work/yo/yo/tests/yofication.rs:323:
-         "правило «всё время» должно сработать — иначе порт MatchRegExp сломан"
-     );
-     assert_eq!(with_sink.text, "всё время");
--    assert_eq!(
--        without.re, 0,
--        "с выключенными правилами их быть не должно"
--    );
-+    assert_eq!(without.re, 0, "с выключенными правилами их быть не должно");
-     assert_eq!(without.no_re, 0);
-     assert_eq!(without_sink.text, "все время");
+Diff in /home/runner/work/yo/yo/src/main.rs:1687:
+         !self.help
+             && !self.version
+             && !self.gui
+-            && (self.input.is_some()
+-                || self.output.is_some()
+-                || !std::io::stdin().is_terminal())
++            && (self.input.is_some() || self.output.is_some() || !std::io::stdin().is_terminal())
+     }
  }
+ 
+Diff in /home/runner/work/yo/yo/tests/cli.rs:243:
+         "stderr: {}",
+         String::from_utf8_lossy(&out.stderr)
+     );
+-    assert_eq!(String::from_utf8(out.stdout).expect("stdout не в UTF-8"), "ёлка");
++    assert_eq!(
++        String::from_utf8(out.stdout).expect("stdout не в UTF-8"),
++        "ёлка"
++    );
+ }
+ 
+ // ─────────────────────────────────────────────────────────────────────────────
 ```
 
 ### cargo clippy --all-targets --all-features -- -D warnings
@@ -32,15 +43,33 @@ Diff in /home/runner/work/yo/yo/tests/yofication.rs:323:
 ### cargo test --all
 ```
      Running unittests src/lib.rs (target/debug/deps/yol-5b545d89ebb0e6e7)
-test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.31s
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.48s
      Running unittests src/main.rs (target/debug/deps/yol-47a93e640578abb6)
 test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
      Running tests/cli.rs (target/debug/deps/cli-e4fa25aa4e3f858e)
-test stdin_to_stdout_is_yofied ... FAILED
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.93s
+     Running tests/dictionary.rs (target/debug/deps/dictionary-2304c42ce4df7243)
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.47s
+     Running tests/encoding.rs (target/debug/deps/encoding-48837f063d5c9d52)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running tests/yofication.rs (target/debug/deps/yofication-6f2a6aef793c1e62)
+test cancel_stops_the_run ... FAILED
+test fb2_binary_tail_is_not_touched ... FAILED
+test cancellation_stops_early_but_keeps_the_text_consistent ... FAILED
+test stats_count_what_the_gui_shows ... FAILED
 failures:
----- stdin_to_stdout_is_yofied stdout ----
-thread 'stdin_to_stdout_is_yofied' (3911) panicked at tests/cli.rs:214:5:
+---- cancel_stops_the_run stdout ----
+thread 'cancel_stops_the_run' (4177) panicked at tests/yofication.rs:272:5:
+---- fb2_binary_tail_is_not_touched stdout ----
+thread 'fb2_binary_tail_is_not_touched' (4182) panicked at tests/yofication.rs:350:5:
+---- cancellation_stops_early_but_keeps_the_text_consistent stdout ----
+thread 'cancellation_stops_early_but_keeps_the_text_consistent' (4178) panicked at tests/yofication.rs:438:5:
+---- stats_count_what_the_gui_shows stdout ----
+thread 'stats_count_what_the_gui_shows' (4198) panicked at tests/yofication.rs:365:5:
 failures:
-test result: FAILED. 11 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.39s
-error: test failed, to rerun pass `--test cli`
+test result: FAILED. 23 passed; 4 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.54s
+error: test failed, to rerun pass `--test yofication`
+   Doc-tests yol
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+error: 1 target failed:
 ```

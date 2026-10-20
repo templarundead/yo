@@ -1,12 +1,23 @@
-Diff in /home/runner/work/yo/yo/tests/yofication.rs:323:
-         "правило «всё время» должно сработать — иначе порт MatchRegExp сломан"
-     );
-     assert_eq!(with_sink.text, "всё время");
--    assert_eq!(
--        without.re, 0,
--        "с выключенными правилами их быть не должно"
--    );
-+    assert_eq!(without.re, 0, "с выключенными правилами их быть не должно");
-     assert_eq!(without.no_re, 0);
-     assert_eq!(without_sink.text, "все время");
+Diff in /home/runner/work/yo/yo/src/main.rs:1687:
+         !self.help
+             && !self.version
+             && !self.gui
+-            && (self.input.is_some()
+-                || self.output.is_some()
+-                || !std::io::stdin().is_terminal())
++            && (self.input.is_some() || self.output.is_some() || !std::io::stdin().is_terminal())
+     }
  }
+ 
+Diff in /home/runner/work/yo/yo/tests/cli.rs:243:
+         "stderr: {}",
+         String::from_utf8_lossy(&out.stderr)
+     );
+-    assert_eq!(String::from_utf8(out.stdout).expect("stdout не в UTF-8"), "ёлка");
++    assert_eq!(
++        String::from_utf8(out.stdout).expect("stdout не в UTF-8"),
++        "ёлка"
++    );
+ }
+ 
+ // ─────────────────────────────────────────────────────────────────────────────
