@@ -514,6 +514,7 @@ impl Stats {
 /// Хранит «ё-форму» (`yo`), «е-форму» (`ye`) и заранее посчитанный ключ
 /// поиска `lc = LC(ye)` — поэтому в горячем цикле обращения к словарю не
 /// делают ни одной аллокации и ни одного приведения регистра.
+#[derive(Default)]
 pub struct Dictionary {
     ye: Vec<String>,
     lc: Vec<String>,
@@ -524,20 +525,6 @@ pub struct Dictionary {
     /// `UserSel` — «всегда Е» / «всегда Ё».
     user_sel: Vec<AtomicU8>,
     version: String,
-}
-
-impl Default for Dictionary {
-    fn default() -> Self {
-        Self {
-            ye: Vec::new(),
-            lc: Vec::new(),
-            yo: Vec::new(),
-            ask: Vec::new(),
-            answer: Vec::new(),
-            user_sel: Vec::new(),
-            version: String::new(),
-        }
-    }
 }
 
 impl Dictionary {
@@ -1210,7 +1197,6 @@ impl Engine {
         };
         let (head, tail) = input.split_at(limit);
 
-        let mut iter = head.char_indices();
         let mut word_start = 0usize;
         let mut word_len = 0usize;
         let mut word_ye_yo = false;
@@ -1218,7 +1204,7 @@ impl Engine {
         let mut counter = 0u64;
         let mut stop_at = head.len();
 
-        while let Some((idx, c)) = iter.next() {
+        for (idx, c) in head.char_indices() {
             if is_alpha(c) {
                 if self.word.is_empty() {
                     word_start = idx;
@@ -1495,7 +1481,7 @@ impl Engine {
             || (has_w2 && to_check_ell)
             || (has_w2
                 && self.opts.to_confirm_cap
-                && c_word.chars().next().map_or(false, is_upper)
+                && c_word.chars().next().is_some_and(is_upper)
                 && !always);
 
         let is_yo_c_word = is_yo_in(c_word);
@@ -1664,27 +1650,19 @@ impl Engine {
         let mut it = input[..word_start].char_indices().rev();
         let mut to_cut = false;
         for n in 1..=CONTEXT_WORDS {
-            loop {
-                match it.next() {
-                    Some((_, c)) => {
-                        pre.push(c);
-                        if is_alpha(c) {
-                            break;
-                        }
-                    }
-                    None => break,
+            // Разделитель перед очередным словом контекста.
+            for (_, c) in it.by_ref() {
+                pre.push(c);
+                if is_alpha(c) {
+                    break;
                 }
             }
-            loop {
-                match it.next() {
-                    Some((_, c)) => {
-                        pre.push(c);
-                        if !is_alpha(c) {
-                            to_cut = n == CONTEXT_WORDS;
-                            break;
-                        }
-                    }
-                    None => break,
+            // Само слово — до ближайшего разделителя.
+            for (_, c) in it.by_ref() {
+                pre.push(c);
+                if !is_alpha(c) {
+                    to_cut = n == CONTEXT_WORDS;
+                    break;
                 }
             }
         }
@@ -1704,27 +1682,19 @@ impl Engine {
         let mut it = input[word_end..].char_indices();
         let mut to_cut = false;
         for n in 1..=CONTEXT_WORDS {
-            loop {
-                match it.next() {
-                    Some((_, c)) => {
-                        post.push(c);
-                        if is_alpha(c) {
-                            break;
-                        }
-                    }
-                    None => break,
+            // Разделитель перед очередным словом контекста.
+            for (_, c) in it.by_ref() {
+                post.push(c);
+                if is_alpha(c) {
+                    break;
                 }
             }
-            loop {
-                match it.next() {
-                    Some((_, c)) => {
-                        post.push(c);
-                        if !is_alpha(c) {
-                            to_cut = n == CONTEXT_WORDS;
-                            break;
-                        }
-                    }
-                    None => break,
+            // Само слово — до ближайшего разделителя.
+            for (_, c) in it.by_ref() {
+                post.push(c);
+                if !is_alpha(c) {
+                    to_cut = n == CONTEXT_WORDS;
+                    break;
                 }
             }
         }
@@ -1790,7 +1760,7 @@ pub fn match_regexp(
                 }
             }
             j += 1;
-            if ci >= di && ci <= di + w_len - 1 {
+            if ci >= di && ci < di + w_len {
                 is_new_word = true;
             }
         }
@@ -2028,8 +1998,10 @@ mod tests {
 
     #[test]
     fn check_yo_off_keeps_yo() {
-        let mut o = YoOptions::default();
-        o.check_yo = false;
+        let o = YoOptions {
+            check_yo: false,
+            ..Default::default()
+        };
         let (out, _) = run("ёлка елка", o);
         assert_eq!(out, "ёлка ёлка");
     }

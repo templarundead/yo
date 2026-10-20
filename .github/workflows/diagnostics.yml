@@ -1,13 +1,12 @@
 # =============================================================================
-#  TEMPORARY diagnostics workflow — используется только во время разработки.
+#  TEMPORARY diagnostics workflow — только на время разработки.
 #
-#  Зачем: логи GitHub Actions читаются с results-receiver.actions.githubusercontent.com,
+#  Зачем: логи GitHub Actions лежат на results-receiver.actions.githubusercontent.com,
 #  который недоступен из рабочей песочницы. Этот workflow складывает вывод
 #  `cargo fmt` / `cargo clippy` / `cargo test` в комментарий к PR, откуда его
 #  уже можно прочитать через api.github.com.
 #
-#  Запуск вручную:  gh workflow run diagnostics.yml --ref <branch>
-#  По завершении — удалить.
+#  По завершении работы — удалить файл.
 # =============================================================================
 
 name: Diagnostics (temporary)
@@ -63,71 +62,104 @@ jobs:
           shared-key: yol-diag
 
       # ── 1. Форматирование ──────────────────────────────────────────────
-      - name: Run cargo fmt and push the result
+      - name: Check formatting
+        id: fmt
+        run: |
+          set +e
+          cargo fmt --all -- --check > fmt.patch 2>&1
+          echo "exit=$?" >> "$GITHUB_OUTPUT"
+          set -e
+
+      # ── 2. Компиляция и линтер ─────────────────────────────────────────
+      # `--message-format=short` даёт по одной строке на диагностику и
+      # отбрасывает весь прогресс сборки, иначе полезный вывод тонет в шуме.
+      - name: Clippy
+        id: clippy
+        run: |
+          set +e
+          cargo clippy --all-targets --all-features --message-format=short -- -D warnings 2>&1 \
+            | grep -E '^(src/|tests/|benches/|error|warning)' \
+            | awk '!seen[$0]++' \
+            | head -150 > clippy.txt
+          echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          set -e
+          cat clippy.txt
+
+      # ── 3. Тесты ───────────────────────────────────────────────────────
+      - name: Build test binaries
+        id: build
+        run: |
+          set +e
+          cargo test --all --no-run --message-format=short 2>&1 \
+            | grep -E '^(src/|tests/|error|warning)' \
+            | awk '!seen[$0]++' \
+            | head -150 > build.txt
+          echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          set -e
+          cat build.txt
+
+      - name: Run tests
+        id: test
+        run: |
+          set +e
+          cargo test --all 2>&1 \
+            | grep -E 'test result|panicked at|^---- |^error|FAILED|^failures:|Running|Doc-tests' \
+            | head -120 > test.txt
+          echo "exit=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+          set -e
+          cat test.txt
+
+      # ── 4. Результат — комментарием в PR ───────────────────────────────
+      - name: Post diagnostics as a PR comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FMT_EXIT: ${{ steps.fmt.outputs.exit }}
+          CLIPPY_EXIT: ${{ steps.clippy.outputs.exit }}
+          BUILD_EXIT: ${{ steps.build.outputs.exit }}
+          TEST_EXIT: ${{ steps.test.outputs.exit }}
+        run: |
+          trim() { if [ -s "$1" ]; then head -c "$2" "$1"; echo; echo "… (обрезано)"; else echo "(пусто)"; fi; }
+          {
+            echo "## Диагностика CI (временный workflow)"
+            echo
+            echo "- ветка: \`${GITHUB_REF_NAME}\`, коммит: \`${GITHUB_SHA::7}\`"
+            echo "- fmt: \`${FMT_EXIT}\` · clippy: \`${CLIPPY_EXIT}\` · build: \`${BUILD_EXIT}\` · test: \`${TEST_EXIT}\`"
+            echo
+            echo "### cargo fmt --all -- --check"
+            echo '```diff'
+            trim fmt.patch 8000
+            echo '```'
+            echo
+            echo "### cargo clippy --all-targets --all-features -- -D warnings"
+            echo '```'
+            trim clippy.txt 12000
+            echo '```'
+            echo
+            echo "### cargo test --all --no-run"
+            echo '```'
+            trim build.txt 12000
+            echo '```'
+            echo
+            echo "### cargo test --all"
+            echo '```'
+            trim test.txt 10000
+            echo '```'
+          } > body.md
+          wc -c body.md
+          gh pr comment 2 --repo templarundead/yo --body-file body.md
+
+      # ── 5. Автоформатирование — в самом конце, чтобы push не отменил прогон
+      - name: Apply cargo fmt and push
+        if: always()
         run: |
           cargo fmt --all
-          if git diff --quiet; then
-            echo "ALREADY_FORMATTED=1" >> "$GITHUB_ENV"
-            : > fmt.patch
-          else
-            echo "ALREADY_FORMATTED=0" >> "$GITHUB_ENV"
-            git --no-pager diff > fmt.patch
+          if ! git diff --quiet; then
             git config user.name "arena-bot"
             git config user.email "bot@arena.local"
             git add -A
             git commit -m "style: cargo fmt --all"
             git push origin "HEAD:${{ github.ref_name }}"
+          else
+            echo "already formatted"
           fi
-
-      # ── 2. Компиляция и линтер ────────────────────────────────────────
-      - name: Clippy
-        id: clippy
-        run: |
-          set +e
-          cargo clippy --all-targets --all-features -- -D warnings > clippy.txt 2>&1
-          echo "exit=$?" >> "$GITHUB_OUTPUT"
-          set -e
-          tail -60 clippy.txt
-
-      # ── 3. Тесты ──────────────────────────────────────────────────────
-      - name: Tests
-        id: test
-        run: |
-          set +e
-          cargo test --all > test.txt 2>&1
-          echo "exit=$?" >> "$GITHUB_OUTPUT"
-          set -e
-          tail -80 test.txt
-
-      # ── 4. Результат — комментарием в PR ──────────────────────────────
-      - name: Post diagnostics as a PR comment
-        if: always()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CLIPPY_EXIT: ${{ steps.clippy.outputs.exit }}
-          TEST_EXIT: ${{ steps.test.outputs.exit }}
-        run: |
-          trim() { head -c "$2" "$1"; echo; echo "… (обрезано)"; }
-          {
-            echo "## Диагностика CI (временный workflow)"
-            echo
-            echo "- ветка: \`${GITHUB_REF_NAME}\`"
-            echo "- clippy exit: \`${CLIPPY_EXIT}\`, test exit: \`${TEST_EXIT}\`"
-            echo
-            echo "### cargo fmt --all"
-            echo '```diff'
-            if [ -s fmt.patch ]; then trim fmt.patch 12000; else echo "(уже отформатировано)"; fi
-            echo '```'
-            echo
-            echo "### cargo clippy --all-targets --all-features -- -D warnings"
-            echo '```'
-            if [ -s clippy.txt ]; then trim clippy.txt 24000; else echo "(вывод пуст)"; fi
-            echo '```'
-            echo
-            echo "### cargo test --all"
-            echo '```'
-            if [ -s test.txt ]; then trim test.txt 24000; else echo "(вывод пуст)"; fi
-            echo '```'
-          } > body.md
-          wc -c body.md
-          gh pr comment 2 --repo templarundead/yo --body-file body.md

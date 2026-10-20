@@ -426,7 +426,7 @@ impl YoApp {
 
     /// Забрать всё, что накопилось в канале (не блокируя главный поток).
     fn pump(&mut self) {
-        let Some(mut run) = self.run.take() else {
+        let Some(run) = self.run.take() else {
             return;
         };
         let mut finished = false;
@@ -1236,6 +1236,7 @@ impl YoApp {
             return;
         }
         let mut open = true;
+        let mut close = false;
         let title = if self.dialog.is_save {
             "Сохранить результат"
         } else {
@@ -1339,7 +1340,7 @@ impl YoApp {
                         });
                     }
                     if ui.button("Отмена").clicked() {
-                        open = false;
+                        close = true;
                     }
                     if !self.dialog.status.is_empty() {
                         ui.colored_label(COLOR_MARK, self.dialog.status.as_str());
@@ -1347,7 +1348,8 @@ impl YoApp {
                 });
             });
 
-        self.dialog.open = open;
+        // `open` снимается крестиком окна, `close` — кнопкой «Отмена».
+        let mut open = open && !close;
         if let Some(d) = new_dir {
             self.dialog.dir = d;
             self.dialog.refresh();
@@ -1357,7 +1359,7 @@ impl YoApp {
                 FileAction::Load(p, enc) => {
                     if p.is_file() {
                         self.load_path(p, Some(enc));
-                        self.dialog.open = false;
+                        open = false;
                     } else {
                         self.dialog.status = "это не файл".to_owned();
                     }
@@ -1365,13 +1367,14 @@ impl YoApp {
                 FileAction::Save(p, enc) => {
                     if p.parent().map(|x| x.is_dir()).unwrap_or(false) {
                         self.save_path(p, enc);
-                        self.dialog.open = false;
+                        open = false;
                     } else {
                         self.dialog.status = "нет такой папки".to_owned();
                     }
                 }
             }
         }
+        self.dialog.open = open;
     }
 
     fn options_window(&mut self, ctx: &egui::Context) {
@@ -1379,6 +1382,7 @@ impl YoApp {
             return;
         }
         let mut open = true;
+        let mut close = false;
         egui::Window::new("Опции")
             .open(&mut open)
             .resizable(false)
@@ -1431,11 +1435,11 @@ impl YoApp {
                         self.opts = YoOptions::default();
                     }
                     if ui.button("Закрыть").clicked() {
-                        open = false;
+                        close = true;
                     }
                 });
             });
-        self.show_options = open;
+        self.show_options = open && !close;
     }
 
     fn about_window(&mut self, ctx: &egui::Context) {
