@@ -1861,6 +1861,27 @@ impl TextEncoding {
     }
 }
 
+/// Разобрать тело UTF-16 (уже без BOM) в последовательность кодовых единиц.
+///
+/// Неполный последний байт отбрасывается — как и у `chunks_exact`.
+/// Обходимся без `chunks_exact`: свежий clippy предлагает вместо него
+/// `as_chunks`, а тот появился только в Rust 1.88 и сломал бы сборку
+/// на более старых компиляторах.
+pub fn utf16_units(body: &[u8], little_endian: bool) -> Vec<u16> {
+    let mut units = Vec::with_capacity(body.len() / 2);
+    let mut i = 0;
+    while i + 1 < body.len() {
+        let pair = [body[i], body[i + 1]];
+        units.push(if little_endian {
+            u16::from_le_bytes(pair)
+        } else {
+            u16::from_be_bytes(pair)
+        });
+        i += 2;
+    }
+    units
+}
+
 /// Распознать кодировку по BOM, иначе — «похоже на UTF-8?» (`AutoUnicode`).
 pub fn decode_bytes(bytes: &[u8]) -> (String, TextEncoding) {
     if bytes.len() >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF {
@@ -1868,18 +1889,16 @@ pub fn decode_bytes(bytes: &[u8]) -> (String, TextEncoding) {
         return (s, TextEncoding::Utf8Bom);
     }
     if bytes.len() >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE {
-        let u: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-        return (String::from_utf16_lossy(&u), TextEncoding::Utf16Le);
+        return (
+            String::from_utf16_lossy(&utf16_units(&bytes[2..], true)),
+            TextEncoding::Utf16Le,
+        );
     }
     if bytes.len() >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF {
-        let u: Vec<u16> = bytes[2..]
-            .chunks_exact(2)
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
-            .collect();
-        return (String::from_utf16_lossy(&u), TextEncoding::Utf16Be);
+        return (
+            String::from_utf16_lossy(&utf16_units(&bytes[2..], false)),
+            TextEncoding::Utf16Be,
+        );
     }
     if let Ok(s) = std::str::from_utf8(bytes) {
         (s.to_owned(), TextEncoding::Utf8)
@@ -2143,6 +2162,26 @@ mod tests {
         let (s, enc) = decode_bytes(&[0xEF, 0xBB, 0xBF, b'a', b'b']);
         assert_eq!(s, "ab");
         assert_eq!(enc, TextEncoding::Utf8Bom);
+    }
+
+    #[test]
+    fn utf16_units_drop_an_incomplete_tail() {
+        // Тело уже без BOM; непарный последний байт молча отбрасывается.
+        assert_eq!(utf16_units(&[0x41, 0x00, 0x42], true), vec![0x0041]);
+        assert_eq!(
+            utf16_units(&[0x00, 0x41, 0x00, 0x42, 0x00], false),
+            vec![0x0041, 0x0042]
+        );
+        assert!(utf16_units(&[0x41], true).is_empty());
+    }
+
+    #[test]
+    fn utf16_with_an_odd_length_body_decodes() {
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend_from_slice(&[0x41, 0x00, 0x42]); // 'A' + непарный хвост
+        let (s, enc) = decode_bytes(&bytes);
+        assert_eq!(s, "A");
+        assert_eq!(enc, TextEncoding::Utf16Le);
     }
 
     #[test]

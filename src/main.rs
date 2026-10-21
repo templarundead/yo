@@ -39,7 +39,8 @@ use egui::widgets::text_edit::TextEditState;
 // модулем: так его же можно покрывать интеграционными тестами из tests/.
 use yol::yo_core::{
     clear_user_selections, database_info, decode_bytes, decode_cp1251, encode_string, preload,
-    AmbiguousPolicy, AskDecision, AskRequest, Engine, Sink, Stats, TextEncoding, YoOptions,
+    utf16_units, AmbiguousPolicy, AskDecision, AskRequest, Engine, Sink, Stats, TextEncoding,
+    YoOptions,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -300,17 +301,7 @@ fn decode_with(bytes: &[u8], enc: TextEncoding) -> String {
             } else {
                 (0, enc == TextEncoding::Utf16Le)
             };
-            let units: Vec<u16> = bytes[skip..]
-                .chunks_exact(2)
-                .map(|c| {
-                    if le {
-                        u16::from_le_bytes([c[0], c[1]])
-                    } else {
-                        u16::from_be_bytes([c[0], c[1]])
-                    }
-                })
-                .collect();
-            String::from_utf16_lossy(&units)
+            String::from_utf16_lossy(&utf16_units(&bytes[skip..], le))
         }
     }
 }
@@ -1433,7 +1424,7 @@ fn paint_word_rect(painter: &egui::Painter, rect: egui::Rect) {
     painter.hline(
         rect.x_range(),
         rect.bottom(),
-        egui::Stroke::new(1.5, COLOR_MARK),
+        egui::Stroke::new(1.5_f32, COLOR_MARK),
     );
 }
 
@@ -1648,7 +1639,7 @@ impl YoApp {
                         .show(ui, |ui| {
                             for (name, is_dir) in entries {
                                 let label = if is_dir {
-                                    format!("[ {} ]", name)
+                                    format!("[ {name} ]")
                                 } else {
                                     name.clone()
                                 };
