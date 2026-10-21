@@ -9,10 +9,17 @@
 //!   ┌──────────── главный поток (egui) ────────────┐       ┌── рабочий поток ──┐
 //!   │  YoApp::update()                             │  mpsc │                   │
 //!   │    ├ pump(): забирает Event из канала     ◄──┼───────┤  Engine::process  │
-//!   │    ├ рисует панель запроса                   │       │   через GuiSink   │
-//!   │    └ ans_tx.send(AskDecision) ───────────────┼──────►│  (стоит на ответе)│
+//!   │    ├ apply_chunk(): text.truncate(base)      │       │   через GuiSink   │
+//!   │    ├ рисует панель запроса                   │       │   (стоит на ответе)│
+//!   │    └ ans_tx.send(AskDecision) ───────────────┼──────►│                   │
 //!   └──────────────────────────────────────────────┘       └───────────────────┘
 //! ```
+//!
+//! Текст в окне один — как единственный `TRichEdit` Delphi-оригинала. Движок
+//! обрабатывает снимок буфера, а интерфейс переписывает этот же `String` «на
+//! месте»: `text.truncate(base)`, затем порция результата и ещё не обработанный
+//! хвост исходника. Поэтому пользователь видит, как буквы меняются прямо в
+//! тексте, а не в отдельной панели «результат».
 //!
 //! Главный поток **никогда** не ждёт рабочий: готовый текст приходит порциями
 //! по 64 КБ, статистика — примерно 15 раз в секунду. Поэтому интерфейс не
@@ -25,11 +32,15 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
 use std::time::Instant;
 
+use egui::text::{CCursor, CCursorRange};
+use egui::widgets::text_edit::TextEditState;
+
 // Ядро живёт в библиотеке `yol` (src/lib.rs → src/yo_core.rs), а не подключается
 // модулем: так его же можно покрывать интеграционными тестами из tests/.
 use yol::yo_core::{
     clear_user_selections, database_info, decode_bytes, decode_cp1251, encode_string, preload,
-    AmbiguousPolicy, AskDecision, AskRequest, Engine, Sink, Stats, TextEncoding, YoOptions,
+    utf16_units, AmbiguousPolicy, AskDecision, AskRequest, Engine, Sink, Stats, TextEncoding,
+    YoOptions,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -59,6 +70,17 @@ const COLOR_MARK_BG: egui::Color32 = egui::Color32::from_rgb(96, 62, 12);
 const COLOR_YE: egui::Color32 = egui::Color32::from_rgb(120, 190, 255);
 const COLOR_YO: egui::Color32 = egui::Color32::from_rgb(150, 240, 150);
 const COLOR_DIM: egui::Color32 = egui::Color32::from_rgb(150, 150, 160);
+/// «Тревожный» заголовок панели запроса (в оригинале — `clRed`).
+const COLOR_ALERT: egui::Color32 = egui::Color32::from_rgb(255, 120, 120);
+
+/// Плашка под спорным словом: полупрозрачная, чтобы буквы оставались видны.
+const COLOR_ASK_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(70, 52, 10, 70);
+
+/// Постоянный id единого редактора: по нему `TextEditState` находит выделение,
+/// которым GUI отмечает спорное слово — аналог `Editor.SelStart/SelLength`.
+fn text_edit_id() -> egui::Id {
+    egui::Id::new("yol_main_text")
+}
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Канал событий рабочего потока
@@ -97,6 +119,27 @@ enum Event {
     Done { stats: Stats },
     /// Что-то пошло не так.
     Failed(String),
+}
+
+/// Переписать единый буфер «на месте»: `base` — длина готового префикса.
+///
+/// Ровно то, что делал оригинал со своим единственным `RichEdit`: хвост после
+/// префикса отбрасывается, вместо него кладётся новая порция, а затем
+/// возвращается ещё не обработанный остаток исходника (`source`). Длина
+/// буфера не меняется — движок меняет только е↔ё, — поэтому курсор,
+/// прокрутка и пометки остаются на месте.
+fn rewrite_in_place(buffer: &mut String, source: Option<&str>, base: usize, chunk: &str) {
+    if base > buffer.len() || !buffer.is_char_boundary(base) {
+        return;
+    }
+    buffer.truncate(base);
+    buffer.push_str(chunk);
+    if let Some(source) = source {
+        let from = (base + chunk.len()).min(source.len());
+        if source.is_char_boundary(from) {
+            buffer.push_str(&source[from..]);
+        }
+    }
 }
 
 /// Живой прогон ёфикации.
@@ -258,17 +301,7 @@ fn decode_with(bytes: &[u8], enc: TextEncoding) -> String {
             } else {
                 (0, enc == TextEncoding::Utf16Le)
             };
-            let units: Vec<u16> = bytes[skip..]
-                .chunks_exact(2)
-                .map(|c| {
-                    if le {
-                        u16::from_le_bytes([c[0], c[1]])
-                    } else {
-                        u16::from_be_bytes([c[0], c[1]])
-                    }
-                })
-                .collect();
-            String::from_utf16_lossy(&units)
+            String::from_utf16_lossy(&utf16_units(&bytes[skip..], le))
         }
     }
 }
@@ -280,8 +313,15 @@ fn decode_with(bytes: &[u8], enc: TextEncoding) -> String {
 struct YoApp {
     // ── данные ──────────────────────────────────────────────────────────
     opts: YoOptions,
-    input: String,
-    output: String,
+    /// Единственный буфер «текст ↔ результат», как единственный RichEdit
+    /// оригинала. Ёфикация переписывает его прямо на месте.
+    text: String,
+    /// Длина `text` в символах (кэш: `chars().count()` на каждый кадр дорог).
+    text_chars: usize,
+    /// Снимок исходника на время прогона: из него после каждой порции
+    /// возвращается ещё не обработанный хвост. Хранится в `Arc`, потому что
+    /// тот же буфер читает рабочий поток.
+    run_source: Option<Arc<String>>,
     marks: Vec<(usize, usize)>,
     /// Журнал замен («было → стало»).
     journal: Vec<(String, String)>,
@@ -289,6 +329,12 @@ struct YoApp {
     // ── состояние ───────────────────────────────────────────────────────
     run: Option<Run>,
     ask: Option<AskRequest>,
+    /// Спорное слово в индексах **символов** — то, что выделяет редактор.
+    ask_selection: Option<(usize, usize)>,
+    /// Куда поставить курсор после ответа (`SelLength := 0` оригинала).
+    selection_after: Option<usize>,
+    /// Прокрутить редактор к спорному слову на ближайшем кадре.
+    scroll_to_ask: bool,
     stats: Stats,
     dict_info: Option<(usize, String, usize, String, u128)>,
     status_left: String,
@@ -297,7 +343,6 @@ struct YoApp {
     dark: bool,
     /// Какая тема уже применена к стилю (`None` — ещё ни одна).
     applied_dark: Option<bool>,
-    split: f32,
     highlight: bool,
     show_journal: bool,
     show_options: bool,
@@ -312,9 +357,15 @@ struct YoApp {
 
 impl YoApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        Self::with_context(&cc.egui_ctx)
+    }
+
+    /// Сборка приложения с готовым `egui::Context`: так `YoApp` можно поднять
+    /// и в тестах, где окна нет вовсе.
+    fn with_context(ctx: &egui::Context) -> Self {
         // Тёмная тема — сразу и по умолчанию.
-        setup_fonts(&cc.egui_ctx);
-        apply_theme(&cc.egui_ctx, true);
+        setup_fonts(ctx);
+        apply_theme(ctx, true);
 
         // Словари (1.8 МБ) разбираем в фоне: окно появляется мгновенно,
         // а первый прогон всё равно дождётся готовности базы.
@@ -322,18 +373,21 @@ impl YoApp {
 
         Self {
             opts: YoOptions::default(),
-            input: String::new(),
-            output: String::new(),
+            text: String::new(),
+            text_chars: 0,
+            run_source: None,
             marks: Vec::new(),
             journal: Vec::new(),
             run: None,
             ask: None,
+            ask_selection: None,
+            selection_after: None,
+            scroll_to_ask: false,
             stats: Stats::default(),
             dict_info: None,
             status_left: "готов — вставьте текст или загрузите файл".to_owned(),
             dark: true,
             applied_dark: None,
-            split: 0.5,
             highlight: true,
             show_journal: false,
             show_options: false,
@@ -358,7 +412,7 @@ impl YoApp {
         if self.busy() {
             return;
         }
-        if self.input.is_empty() {
+        if self.text.is_empty() {
             self.status_left = "нечего ёфицировать".to_owned();
             return;
         }
@@ -367,11 +421,14 @@ impl YoApp {
         let (ans_tx, ans_rx) = mpsc::channel::<AskDecision>();
         let cancel = Arc::new(AtomicBool::new(false));
 
-        let input = self.input.clone();
+        // Движок работает со снимком: буфер интерфейса тем временем
+        // переписывается «на месте» теми же смещениями.
+        let input = Arc::new(self.text.clone());
+        let engine_input = Arc::clone(&input);
         let opts = self.opts.clone();
         let want_journal = self.show_journal;
         let cancel_thread = cancel.clone();
-        let total_chars = self.input.chars().count();
+        let total_chars = self.text_chars;
 
         std::thread::spawn(move || {
             let t0 = Instant::now();
@@ -391,15 +448,18 @@ impl YoApp {
                 rx: &ans_rx,
                 cancel: &cancel_thread,
             };
-            let stats = engine.process(&input, &mut sink);
+            let stats = engine.process(engine_input.as_str(), &mut sink);
             let _ = tx.send(Event::Done { stats });
         });
 
-        self.output.clear();
+        self.run_source = Some(input);
         self.marks.clear();
         self.journal.clear();
         self.stats = Stats::default();
         self.ask = None;
+        self.ask_selection = None;
+        self.selection_after = None;
+        self.scroll_to_ask = false;
         self.run = Some(Run {
             rx,
             ans_tx,
@@ -422,6 +482,10 @@ impl YoApp {
             let _ = tx.send(AskDecision::Cancel);
         }
         self.ask = None;
+        self.scroll_to_ask = false;
+        if let Some((start, _)) = self.ask_selection.take() {
+            self.selection_after = Some(start);
+        }
         self.status_left = "прервано".to_owned();
     }
 
@@ -443,12 +507,7 @@ impl YoApp {
                     self.dict_info = Some((words, dic_version, rules, re_version, elapsed_ms));
                 }
                 Ok(Event::Chunk { base, text, marks }) => {
-                    if self.marks.len() < MAX_GUI_MARKS {
-                        for (s, e) in &marks {
-                            self.marks.push((base + s, base + e));
-                        }
-                    }
-                    self.output.push_str(&text);
+                    self.apply_chunk(base, &text, &marks);
                 }
                 Ok(Event::Journal(entries)) => {
                     for pair in entries {
@@ -459,8 +518,14 @@ impl YoApp {
                     }
                 }
                 Ok(Event::Stats(s)) => self.stats = s,
-                Ok(Event::Ask(req)) => self.ask = Some(req),
-                Ok(Event::Undo { offset, old, new }) => self.patch_output(offset, &old, &new),
+                Ok(Event::Ask(req)) => {
+                    // Куда поставить выделение в едином буфере. Оригинал
+                    // делал ровно это: `Editor.SelStart := Idx`.
+                    self.ask_selection = req.char_range(&self.text);
+                    self.scroll_to_ask = self.ask_selection.is_some();
+                    self.ask = Some(req);
+                }
+                Ok(Event::Undo { offset, old, new }) => self.patch_text(offset, &old, &new),
                 Ok(Event::Done { stats }) => {
                     self.stats = stats;
                     finished = true;
@@ -477,25 +542,63 @@ impl YoApp {
             }
         }
         if finished {
+            let cancelled = run.cancel.load(Ordering::Relaxed);
             self.ask = None;
+            self.scroll_to_ask = false;
+            // Если ответ ещё не успел снять выделение — снимем его на
+            // ближайшем кадре редактора, иначе `selection_after` пропадёт.
+            if let Some((start, _)) = self.ask_selection.take() {
+                self.selection_after = Some(start);
+            }
+            // Остаток исходника больше не нужен: буфер — это результат.
+            self.run_source = None;
             let changed = self.stats.checked_changed;
-            self.status_left = format!("готово · заменено {changed}");
+            self.status_left = if cancelled {
+                format!("прервано · заменено {changed}")
+            } else {
+                format!("готово · заменено {changed}")
+            };
         } else {
             self.run = Some(run);
         }
     }
 
-    /// Откатить уже показанную замену прямо в строке результата.
-    fn patch_output(&mut self, offset: usize, old: &str, new: &str) {
-        let end = match offset.checked_add(new.len()) {
-            Some(e) if e <= self.output.len() => e,
-            _ => return,
-        };
-        if &self.output[offset..end] != new {
+    /// Применить порцию результата к единому буферу «на месте».
+    ///
+    /// `base` — длина уже готового префикса. Ровно как в оригинале с его
+    /// единственным RichEdit: хвост после префикса отбрасывается
+    /// (`truncate`), вместо него кладётся новая порция, а затем возвращается
+    /// ещё не обработанный остаток исходника. Длина буфера не меняется, зато
+    /// пользователь видит, как буквы исправляются прямо в тексте.
+    fn apply_chunk(&mut self, base: usize, chunk: &str, marks: &[(usize, usize)]) {
+        if base > self.text.len() || !self.text.is_char_boundary(base) {
             return;
         }
-        self.output.replace_range(offset..end, old);
-        // Откат может изменить длину текста — сдвигаем все метки после него.
+        if self.marks.len() < MAX_GUI_MARKS {
+            self.marks.reserve(marks.len());
+            for &(s, e) in marks {
+                self.marks.push((base + s, base + e));
+            }
+        }
+        let source = self.run_source.as_deref().map(String::as_str);
+        rewrite_in_place(&mut self.text, source, base, chunk);
+    }
+
+    /// Откатить уже показанную замену прямо в едином буфере.
+    fn patch_text(&mut self, offset: usize, old: &str, new: &str) {
+        let end = match offset.checked_add(new.len()) {
+            Some(e) if e <= self.text.len() => e,
+            _ => return,
+        };
+        if !self.text.is_char_boundary(offset) || !self.text.is_char_boundary(end) {
+            return;
+        }
+        if &self.text[offset..end] != new {
+            return;
+        }
+        self.text.replace_range(offset..end, old);
+        // Откат — это е↔ё, длина не меняется; на всякий случай поддерживаем
+        // и изменение длины, чтобы метки и счётчик остались верными.
         let delta = old.len() as i64 - new.len() as i64;
         if delta != 0 {
             for (s, e) in self.marks.iter_mut() {
@@ -504,6 +607,7 @@ impl YoApp {
                     *e = (*e as i64 + delta) as usize;
                 }
             }
+            self.text_chars = self.text.chars().count();
         }
         self.marks.retain(|&(s, _)| !(s >= offset && s < end));
     }
@@ -514,6 +618,11 @@ impl YoApp {
             Some(r) => r.ans_tx.clone(),
             None => return,
         };
+        if self.ask.is_none() {
+            // Вопрос уже снят (кнопку нажали в этом же кадре, а следом
+            // прилетела горячая клавиша) — второй ответ движку не нужен.
+            return;
+        }
         if let Some(req) = self.ask.take() {
             let chosen = match decision {
                 AskDecision::Ye | AskDecision::YeAll => Some(req.word1.clone()),
@@ -527,6 +636,11 @@ impl YoApp {
                 self.journal.push((req.word1, chosen));
             }
         }
+        // Оригинал после ответа делал `Editor.SelLength := 0`: каретка
+        // остаётся в начале слова, выделение снимается на ближайшем кадре.
+        if let Some((start, _)) = self.ask_selection.take() {
+            self.selection_after = Some(start);
+        }
         let _ = tx.send(decision);
     }
 
@@ -535,6 +649,10 @@ impl YoApp {
     // ────────────────────────────────────────────────────────────────────
 
     fn load_path(&mut self, path: PathBuf, enc: Option<TextEncoding>) {
+        if self.busy() {
+            self.status_left = "дождитесь окончания ёфикации".to_owned();
+            return;
+        }
         match std::fs::read(&path) {
             Ok(bytes) => {
                 let (text, detected) = match enc {
@@ -542,8 +660,9 @@ impl YoApp {
                     None => decode_bytes(&bytes),
                 };
                 let n = text.chars().count();
-                self.input = text;
-                self.output.clear();
+                self.text = text;
+                self.text_chars = n;
+                self.run_source = None;
                 self.marks.clear();
                 self.journal.clear();
                 self.current_file = Some(path.clone());
@@ -560,7 +679,7 @@ impl YoApp {
     }
 
     fn save_path(&mut self, path: PathBuf, enc: TextEncoding) {
-        let bytes = encode_string(&self.output, enc);
+        let bytes = encode_string(&self.text, enc);
         match std::fs::write(&path, bytes) {
             Ok(()) => {
                 self.current_file = Some(path.clone());
@@ -660,6 +779,10 @@ impl eframe::App for YoApp {
         if self.busy() {
             // Иначе egui не будет перерисовываться, пока не придёт ввод.
             ctx.request_repaint();
+            // Esc без вопроса — «Прервать», как в оригинале.
+            if self.ask.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.stop();
+            }
         }
 
         self.menu_bar(ctx);
@@ -669,7 +792,7 @@ impl eframe::App for YoApp {
         if self.ask.is_some() {
             self.ask_panel(ctx);
         }
-        self.central_panes(ctx);
+        self.editor_panel(ctx);
 
         self.file_dialog_window(ctx);
         self.options_window(ctx);
@@ -697,8 +820,8 @@ impl YoApp {
                     }
                     if ui
                         .add_enabled(
-                            !self.output.is_empty(),
-                            egui::Button::new("Сохранить результат…"),
+                            !self.busy() && !self.text.is_empty(),
+                            egui::Button::new("Сохранить текст…"),
                         )
                         .clicked()
                     {
@@ -727,21 +850,73 @@ impl YoApp {
                 });
 
                 ui.menu_button("Правка", |ui| {
-                    if ui.button("Очистить всё").clicked() {
-                        self.input.clear();
-                        self.output.clear();
+                    // Ctrl+X / Ctrl+C / Ctrl+V обслуживает сам `TextEdit`
+                    // (нативные события egui). Пунктам меню достаточно
+                    // попросить об этом eframe: `RequestPaste` заставляет
+                    // интеграцию прочитать системный буфер обмена и прислать
+                    // `Event::Paste` — отдельный `arboard` не нужен.
+                    let idle = !self.busy();
+                    let can_cut = idle && self.has_selection(ctx);
+                    if ui
+                        .add_enabled(can_cut, egui::Button::new("Вырезать"))
+                        .on_hover_text("Ctrl+X")
+                        .clicked()
+                    {
+                        ctx.memory_mut(|m| m.request_focus(text_edit_id()));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::RequestCut);
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(can_cut, egui::Button::new("Копировать"))
+                        .on_hover_text("Ctrl+C")
+                        .clicked()
+                    {
+                        ctx.memory_mut(|m| m.request_focus(text_edit_id()));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::RequestCopy);
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(idle, egui::Button::new("Вставить"))
+                        .on_hover_text("Ctrl+V")
+                        .clicked()
+                    {
+                        ctx.memory_mut(|m| m.request_focus(text_edit_id()));
+                        ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(idle, egui::Button::new("Выделить всё"))
+                        .on_hover_text("Ctrl+A")
+                        .clicked()
+                    {
+                        self.select_all(ctx);
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(
+                            !self.text.is_empty(),
+                            egui::Button::new("Копировать весь текст"),
+                        )
+                        .clicked()
+                    {
+                        ctx.copy_text(self.text.clone());
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui
+                        .add_enabled(
+                            idle && !self.text.is_empty(),
+                            egui::Button::new("Очистить всё"),
+                        )
+                        .clicked()
+                    {
+                        self.text.clear();
+                        self.text_chars = 0;
                         self.marks.clear();
                         self.journal.clear();
-                        ui.close_menu();
-                    }
-                    if ui.button("Результат → исходник").clicked() {
-                        self.input = std::mem::take(&mut self.output);
-                        self.output.clear();
-                        self.marks.clear();
-                        ui.close_menu();
-                    }
-                    if ui.button("Копировать результат").clicked() {
-                        ctx.copy_text(self.output.clone());
+                        self.ask_selection = None;
+                        self.selection_after = None;
                         ui.close_menu();
                     }
                 });
@@ -749,7 +924,7 @@ impl YoApp {
                 ui.menu_button("Ёфикация", |ui| {
                     if ui
                         .add_enabled(
-                            !self.busy() && !self.input.is_empty(),
+                            !self.busy() && !self.text.is_empty(),
                             egui::Button::new("Ёфицировать"),
                         )
                         .clicked()
@@ -886,264 +1061,216 @@ impl YoApp {
         });
     }
 
-    /// Две панели с текстом и перетаскиваемый разделитель.
-    fn central_panes(&mut self, ctx: &egui::Context) {
+    /// Единственный редактор: текст и результат — один и тот же буфер.
+    fn editor_panel(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            let avail = ui.available_size();
-            let sep = 6.0f32;
-            let usable = (avail.x - sep).max(240.0);
-            let left_w = (usable * self.split).max(120.0);
-            let right_w = (usable - left_w).max(120.0);
-
+            ui.add_space(2.0);
             ui.horizontal(|ui| {
-                ui.allocate_ui(egui::vec2(left_w, avail.y), |ui| {
-                    self.editor_pane(ui, true);
-                });
-
-                let (rect, response) =
-                    ui.allocate_exact_size(egui::vec2(sep, avail.y), egui::Sense::drag());
-                if response.dragged() {
-                    self.split = (self.split + response.drag_delta().x / usable).clamp(0.15, 0.85);
-                }
-                let c = if response.hovered() || response.dragged() {
-                    ui.visuals().widgets.hovered.bg_fill
-                } else {
-                    ui.visuals().widgets.noninteractive.bg_fill
-                };
-                ui.painter()
-                    .rect_filled(rect, egui::CornerRadius::same(3), c);
-
-                ui.allocate_ui(egui::vec2(right_w, avail.y), |ui| {
-                    self.editor_pane(ui, false);
-                });
-            });
-        });
-    }
-
-    fn editor_pane(&mut self, ui: &mut egui::Ui, is_input: bool) {
-        let title = if is_input {
-            "Исходный текст"
-        } else {
-            "Результат (ёфицированный)"
-        };
-        let chars = if is_input {
-            self.input.chars().count()
-        } else {
-            self.output.chars().count()
-        };
-
-        ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(title).strong());
-            ui.label(
-                egui::RichText::new(format!("{chars} симв."))
-                    .small()
-                    .color(COLOR_DIM),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut copy = false;
-                let mut clear = false;
-                if ui.small_button("Копировать").clicked() {
-                    copy = true;
-                }
-                if ui.small_button("Очистить").clicked() {
-                    clear = true;
-                }
-                if copy {
-                    let text = if is_input {
-                        self.input.clone()
-                    } else {
-                        self.output.clone()
-                    };
-                    ui.ctx().copy_text(text);
-                }
-                if clear {
-                    if is_input {
-                        self.input.clear();
-                    } else {
-                        self.output.clear();
-                        self.marks.clear();
-                        self.journal.clear();
-                    }
-                }
-            });
-        });
-        ui.separator();
-
-        if chars > MAX_EDITOR_CHARS {
-            ui.vertical_centered(|ui| {
-                ui.add_space(24.0);
+                ui.label(egui::RichText::new("Текст").strong());
                 ui.label(
-                    egui::RichText::new(
-                        "Текст слишком большой для экранного редактора.\n\
-                         Обработайте его в файловом режиме:\n\n    yol -i большой.txt -o результат.txt",
-                    )
-                    .color(COLOR_MARK),
+                    egui::RichText::new(format!("{} симв.", self.text_chars))
+                        .small()
+                        .color(COLOR_DIM),
                 );
+                if self.busy() {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new("ёфикация…")
+                            .small()
+                            .color(COLOR_DIM),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.checkbox(&mut self.highlight, "подсветка замен")
+                        .on_hover_text("Красить буквы, которые изменила ёфикация");
+                });
             });
-            return;
-        }
+            ui.separator();
 
-        if !is_input {
-            ui.checkbox(&mut self.highlight, "подсветка замен");
-        }
+            if self.text_chars > MAX_EDITOR_CHARS {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(24.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Текст слишком большой для экранного редактора.\n\
+                             Обработайте его в файловом режиме:\n\n    yol -i большой.txt -o результат.txt",
+                        )
+                        .color(COLOR_MARK),
+                    );
+                });
+                return;
+            }
 
-        let highlighted = !is_input
-            && self.highlight
-            && self.opts.mark
-            && !self.marks.is_empty()
-            && self.output.len() <= MAX_HIGHLIGHT_CHARS;
+            // Пока идёт прогон, движок переписывает этот же буфер, поэтому
+            // ввод блокируем — как `Editor.ReadOnly := True` оригинала.
+            let busy = self.busy();
+            self.sync_editor_selection(ctx);
+            let ask_word = self.ask_selection;
+            let scroll_now = self.scroll_to_ask && ask_word.is_some();
 
-        ui.push_id(if is_input { "scroll_in" } else { "scroll_out" }, |ui| {
+            let highlighted = self.highlight
+                && self.opts.mark
+                && !self.marks.is_empty()
+                && self.text.len() <= MAX_HIGHLIGHT_CHARS;
+
+            let marks: &[(usize, usize)] = &self.marks;
+            let mut layouter = |ui: &egui::Ui, s: &str, wrap_width: f32| {
+                let mut job = highlight_job(ui, s, marks);
+                job.wrap.max_width = wrap_width;
+                ui.fonts(|f| f.layout_job(job))
+            };
+
+            let row_height = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
+            let rows = ((ui.available_height() / row_height).floor() as usize).max(1);
+            let width = if self.opts.word_wrap {
+                ui.available_width()
+            } else {
+                f32::INFINITY
+            };
+
+            let mut changed = false;
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let width = if self.opts.word_wrap {
-                        ui.available_width()
-                    } else {
-                        f32::INFINITY
-                    };
+                    let mut edit = egui::TextEdit::multiline(&mut self.text)
+                        .id(text_edit_id())
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(width)
+                        .desired_rows(rows)
+                        .frame(false)
+                        .interactive(!busy)
+                        .hint_text(
+                            "Вставьте текст или загрузите файл (Файл → Загрузить текст…)",
+                        );
                     if highlighted {
-                        highlighted_label(ui, &self.output, &self.marks);
-                    } else if is_input {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.input)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(width)
-                                .frame(false)
-                                .hint_text(
-                                    "Вставьте текст или загрузите файл (Файл → Загрузить текст…)",
-                                ),
-                        );
-                    } else {
-                        let r = ui.add(
-                            egui::TextEdit::multiline(&mut self.output)
-                                .font(egui::TextStyle::Monospace)
-                                .desired_width(width)
-                                .frame(false),
-                        );
-                        if r.changed() {
-                            // Ручная правка результата делает пометки неверными.
-                            self.marks.clear();
+                        edit = edit.layouter(&mut layouter);
+                    }
+                    let out = edit.show(ui);
+                    changed = out.response.changed();
+                    if let Some(range) = ask_word {
+                        // `TextEdit` рисует выделение только в фокусе, а
+                        // read-only редактор его не получает — подсвечиваем
+                        // слово сами, как `Editor.SelLength` оригинала.
+                        paint_ask_word(ui, &out, range);
+                        if scroll_now {
+                            // Оригинал прокручивал редактор к спорному слову.
+                            let cursor = out.galley.from_ccursor(CCursor::new(range.0));
+                            let rect = out
+                                .galley
+                                .pos_from_cursor(&cursor)
+                                .translate(out.galley_pos.to_vec2());
+                            ui.scroll_to_rect(rect, Some(egui::Align::Center));
                         }
                     }
                 });
+            if scroll_now {
+                self.scroll_to_ask = false;
+            }
+
+            if changed {
+                // Ручная правка делает пометки неверными.
+                self.marks.clear();
+                self.text_chars = self.text.chars().count();
+            }
         });
     }
 
-    /// Панель запроса — прямая наследница `AskPanel` из Main.dfm.
+    /// Отметить спорное слово в состоянии редактора — аналог
+    /// `Editor.SelStart := Idx; Editor.SelLength := Length(Word1)`.
+    ///
+    /// Состояние `TextEditState` — единственный «официальный» способ задать
+    /// выделение снаружи; видимую плашку рисует [`paint_ask_word`], потому что
+    /// редактор во время прогона только для чтения и фокуса не получает.
+    fn sync_editor_selection(&mut self, ctx: &egui::Context) {
+        let id = text_edit_id();
+        if let Some((start, end)) = self.ask_selection {
+            let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+            state.cursor.set_char_range(Some(CCursorRange::two(
+                CCursor::new(start),
+                CCursor::new(end),
+            )));
+            state.store(ctx, id);
+            return;
+        }
+        if let Some(pos) = self.selection_after.take() {
+            // Ответ получен — снимаем выделение (`SelLength := 0`).
+            let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+            state
+                .cursor
+                .set_char_range(Some(CCursorRange::one(CCursor::new(pos))));
+            state.store(ctx, id);
+        }
+    }
+
+    /// Есть ли в редакторе непустое выделение (для пунктов «Вырезать»/«Копировать»).
+    fn has_selection(&self, ctx: &egui::Context) -> bool {
+        ctx.memory(|mem| mem.has_focus(text_edit_id()))
+            && TextEditState::load(ctx, text_edit_id())
+                .and_then(|s| s.cursor.char_range())
+                .is_some_and(|r| r.primary.index != r.secondary.index)
+    }
+
+    /// Выделить весь текст (Ctrl+A / «Правка → Выделить всё»).
+    fn select_all(&mut self, ctx: &egui::Context) {
+        let n = self.text.chars().count();
+        self.text_chars = n;
+        let id = text_edit_id();
+        let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(n))));
+        state.store(ctx, id);
+        ctx.memory_mut(|mem| mem.request_focus(id));
+    }
+
+    /// Панель запроса — наследница `AskPanel` из Main.dfm.
+    ///
+    /// Рамка с заголовком и шесть кнопок в один ряд ровно по центру окна:
+    /// `[вариант 1] [вариант 2] [Всегда Е (3)] [Всегда Ё (4)] [Откат]
+    /// [Прервать (Esc)]`.
     fn ask_panel(&mut self, ctx: &egui::Context) {
         let Some(ask) = self.ask.clone() else {
             return;
         };
+
+        let mut decision: Option<AskDecision> = None;
         egui::TopBottomPanel::bottom("ask_panel")
             .resizable(false)
+            // Высота запоминается с предыдущего кадра; запас на первый кадр,
+            // чтобы кнопки не оказались за нижним краем окна.
+            .default_height(88.0)
             .show(ctx, |ui| {
-                ui.add_space(6.0);
-                ui.vertical_centered(|ui| {
-                    ui.label(egui::RichText::new("Выберите вариант замены").strong());
-                });
-                ui.add_space(2.0);
-
-                ui.horizontal_wrapped(|ui| {
-                    ui.label(
-                        egui::RichText::new(ask.before.as_str())
-                            .monospace()
-                            .color(COLOR_DIM),
-                    );
-
-                    let label1 = if ask.focus_first {
-                        format!("{} (1)", ask.word1)
-                    } else {
-                        ask.word1.clone()
-                    };
-                    let label2 = if ask.focus_first {
-                        ask.word2.clone()
-                    } else {
-                        format!("{} (2)", ask.word2)
-                    };
-                    if ui
-                        .add(egui::Button::new(
-                            egui::RichText::new(label1)
-                                .monospace()
-                                .strong()
-                                .color(COLOR_YE),
-                        ))
-                        .clicked()
-                    {
-                        self.answer(AskDecision::Ye);
-                    }
-                    ui.label(egui::RichText::new("/").monospace().color(COLOR_DIM));
-                    if ui
-                        .add(egui::Button::new(
-                            egui::RichText::new(label2)
-                                .monospace()
-                                .strong()
-                                .color(COLOR_YO),
-                        ))
-                        .clicked()
-                    {
-                        self.answer(AskDecision::Yo);
-                    }
-                    ui.label(
-                        egui::RichText::new(ask.after.as_str())
-                            .monospace()
-                            .color(COLOR_DIM),
-                    );
-                });
-
-                ui.add_space(4.0);
-                ui.horizontal_wrapped(|ui| {
-                    if ui.button("Всегда Е (3)").clicked() {
-                        self.answer(AskDecision::YeAll);
-                    }
-                    if ui.button("Всегда Ё (4)").clicked() {
-                        self.answer(AskDecision::YoAll);
-                    }
-                    if ui.button("Откат").clicked() {
-                        self.answer(AskDecision::Undo);
-                    }
-                    if ui.button("Прервать (Esc)").clicked() {
-                        self.answer(AskDecision::Cancel);
-                    }
-                    if ask.wrong_yo {
-                        ui.colored_label(
-                            COLOR_MARK,
-                            egui::RichText::new("подозрительная «ё»").small(),
-                        );
-                    } else if ask.replaced_yo {
-                        ui.colored_label(
-                            COLOR_MARK,
-                            egui::RichText::new("«ё» стоит не там").small(),
-                        );
-                    }
-                    if ask.wrong_ye {
-                        ui.colored_label(
-                            COLOR_YE,
-                            egui::RichText::new("замена без запроса").small(),
-                        );
-                    }
-                });
-
-                // Горячие клавиши 1–4 и Esc.
-                let mut decision: Option<AskDecision> = None;
-                ui.input(|i| {
-                    if i.key_pressed(egui::Key::Num1) {
-                        decision = Some(AskDecision::Ye);
-                    } else if i.key_pressed(egui::Key::Num2) {
-                        decision = Some(AskDecision::Yo);
-                    } else if i.key_pressed(egui::Key::Num3) {
-                        decision = Some(AskDecision::YeAll);
-                    } else if i.key_pressed(egui::Key::Num4) {
-                        decision = Some(AskDecision::YoAll);
-                    } else if i.key_pressed(egui::Key::Escape) {
-                        decision = Some(AskDecision::Cancel);
-                    }
-                });
-                if let Some(d) = decision {
-                    self.answer(d);
-                }
-                ui.add_space(6.0);
+                let (clicked, _) = ask_panel_ui(ui, &ask);
+                decision = clicked;
             });
+
+        // Горячие клавиши: 1–4, Enter (вариант в фокусе, как bYe/bYo
+        // оригинала) и Esc.
+        if decision.is_none() {
+            ctx.input(|i| {
+                if i.key_pressed(egui::Key::Num1) {
+                    decision = Some(AskDecision::Ye);
+                } else if i.key_pressed(egui::Key::Num2) {
+                    decision = Some(AskDecision::Yo);
+                } else if i.key_pressed(egui::Key::Num3) {
+                    decision = Some(AskDecision::YeAll);
+                } else if i.key_pressed(egui::Key::Num4) {
+                    decision = Some(AskDecision::YoAll);
+                } else if i.key_pressed(egui::Key::Escape) {
+                    decision = Some(AskDecision::Cancel);
+                } else if i.key_pressed(egui::Key::Enter) {
+                    // В оригинале фокус стоял на bYe или bYo, и Enter нажимал её.
+                    decision = Some(if ask.focus_first {
+                        AskDecision::Ye
+                    } else {
+                        AskDecision::Yo
+                    });
+                }
+            });
+        }
+        if let Some(d) = decision {
+            self.answer(d);
+        }
     }
 
     /// Строка состояния: слева — состояние, справа — статистика в формате
@@ -1194,11 +1321,18 @@ fn next_policy(p: AmbiguousPolicy) -> AmbiguousPolicy {
     }
 }
 
-/// Рендер текста с подсветкой изменённых букв (через `LayoutJob`).
-fn highlighted_label(ui: &mut egui::Ui, text: &str, marks: &[(usize, usize)]) {
+/// `LayoutJob` для единого редактора: обычный моноширинный текст плюс
+/// подсветка изменённых букв.
+///
+/// Текст обязан остаться ровно тем же, что и в буфере (никаких вставок),
+/// иначе `TextEdit` потеряет соответствие курсора и строк. Шрифт и цвет
+/// повторяют умолчания `TextEdit`, чтобы включение подсветки не «дёргало»
+/// вёрстку.
+fn highlight_job(ui: &egui::Ui, text: &str, marks: &[(usize, usize)]) -> egui::text::LayoutJob {
     let normal = egui::TextFormat {
         font_id: egui::FontId::new(14.5, egui::FontFamily::Monospace),
-        color: ui.visuals().text_color(),
+        // Тот же цвет, что берёт сам `TextEdit` по умолчанию.
+        color: ui.visuals().widgets.inactive.text_color(),
         ..Default::default()
     };
     let mut hot = normal.clone();
@@ -1224,7 +1358,218 @@ fn highlighted_label(ui: &mut egui::Ui, text: &str, marks: &[(usize, usize)]) {
     if pos < text.len() {
         job.append(&text[pos..], 0.0, normal);
     }
-    ui.label(job);
+    job
+}
+
+/// Подсветить спорное слово прямо в редакторе.
+///
+/// `TextEdit` рисует собственное выделение только у виджета в фокусе, а
+/// во время прогона редактор только для чтения (`interactive(false)`) и фокус
+/// тут же сбрасывается. Поэтому плашку и подчёркивание рисуем сами — ровно то,
+/// что делал `Editor.SelStart/SelLength` оригинала.
+fn paint_ask_word(
+    ui: &egui::Ui,
+    out: &egui::widgets::text_edit::TextEditOutput,
+    (start, end): (usize, usize),
+) {
+    let galley = &out.galley;
+    if start >= end {
+        return;
+    }
+    let caret_start = galley
+        .pos_from_cursor(&galley.from_ccursor(CCursor::new(start)))
+        .translate(out.galley_pos.to_vec2());
+    let caret_end = galley
+        .pos_from_cursor(&galley.from_ccursor(CCursor::new(end)))
+        .translate(out.galley_pos.to_vec2());
+
+    let painter = ui.painter_at(out.text_clip_rect);
+    let first = caret_start.center().y;
+    let last = caret_end.center().y;
+
+    if (first - last).abs() < 0.5 {
+        // Слово целиком на одной строке — обычный случай.
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(caret_start.left(), caret_start.top()),
+            egui::pos2(caret_end.left(), caret_start.bottom()),
+        );
+        paint_word_rect(&painter, rect);
+    } else {
+        // Слово переносится: подсвечиваем хвост первой строки, все
+        // промежуточные целиком и начало последней.
+        let mut rect = egui::Rect::from_min_max(
+            egui::pos2(caret_start.left(), caret_start.top()),
+            egui::pos2(galley.rect.right() + out.galley_pos.x, caret_start.bottom()),
+        );
+        paint_word_rect(&painter, rect);
+        for row in galley.rows.iter() {
+            let row_rect = row.rect.translate(out.galley_pos.to_vec2());
+            if row_rect.center().y <= first + 0.5 || row_rect.center().y >= last - 0.5 {
+                continue;
+            }
+            rect = row_rect;
+            paint_word_rect(&painter, rect);
+        }
+        let rect = egui::Rect::from_min_max(
+            egui::pos2(out.galley_pos.x, caret_end.top()),
+            egui::pos2(caret_end.left(), caret_end.bottom()),
+        );
+        paint_word_rect(&painter, rect);
+    }
+}
+
+/// Плашка + подчёркивание: заметно, но текст остаётся читаемым.
+fn paint_word_rect(painter: &egui::Painter, rect: egui::Rect) {
+    painter.rect_filled(rect.expand2(egui::vec2(1.0, 1.0)), 2.0, COLOR_ASK_BG);
+    painter.hline(
+        rect.x_range(),
+        rect.bottom(),
+        egui::Stroke::new(1.5_f32, COLOR_MARK),
+    );
+}
+
+/// Тело панели запроса: рамка с заголовком и ряд из шести кнопок.
+///
+/// Вынесено из метода, чтобы вёрстку можно было проверить в тестах без окна
+/// (см. `mod gui_tests`). Возвращает нажатое решение и прямоугольник ряда —
+/// по нему тест убеждается, что кластер стоит ровно по центру.
+fn ask_panel_ui(ui: &mut egui::Ui, ask: &AskRequest) -> (Option<AskDecision>, egui::Rect) {
+    let title = ask_title(ask);
+    let title_color = if ask.wrong_yo || ask.replaced_yo || ask.wrong_ye {
+        COLOR_ALERT
+    } else {
+        COLOR_YE
+    };
+    let mut decision = None;
+    let mut row = egui::Rect::NOTHING;
+
+    ui.add_space(8.0);
+    ui.vertical_centered(|ui| {
+        egui::Frame::group(ui.style())
+            .inner_margin(egui::Margin::same(10))
+            .show(ui, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(egui::RichText::new(title).strong().color(title_color));
+                    ui.add_space(6.0);
+                    // egui не центрирует группу кнопок сам: измеряем ряд и
+                    // заказываем ровно такую ширину — тогда кластер встаёт
+                    // мёртво по центру, как в оригинале.
+                    let buttons = ask_buttons(ask);
+                    let size = ask_row_size(ui, &buttons);
+                    let response = ui.allocate_ui_with_layout(
+                        size,
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            for (text, d, enabled, hint) in buttons {
+                                let response = ui
+                                    .add_enabled(
+                                        enabled,
+                                        egui::Button::new(text)
+                                            .wrap_mode(egui::TextWrapMode::Extend),
+                                    )
+                                    .on_hover_text(hint);
+                                if response.clicked() {
+                                    decision = Some(d);
+                                }
+                            }
+                        },
+                    );
+                    row = response.response.rect;
+                });
+            });
+    });
+    ui.add_space(8.0);
+
+    (decision, row)
+}
+
+/// Заголовок панели запроса — точь-в-точь `SetAskParams` из Main.pas.
+fn ask_title(ask: &AskRequest) -> &'static str {
+    if ask.replaced_yo {
+        "Странное расположение «Ё»"
+    } else if ask.wrong_yo {
+        "Вероятно, здесь должна быть «Е»"
+    } else if ask.wrong_ye {
+        "Вероятно, здесь должна быть «Ё»"
+    } else {
+        "Выберите верный вариант"
+    }
+}
+
+/// Кнопки панели запроса: подпись, решение, доступность и подсказка.
+///
+/// Набор и подписи повторяют `InitButtons`/`SetButtonCaption` оригинала:
+/// `Е (&1)` → `Ё (&2)` → `Всегда Е (&3)` → `Всегда Ё (&4)` → `Откат` →
+/// `Прервать (Esc)`, только вместо «Е/Ё» показаны сами варианты слова.
+fn ask_buttons(ask: &AskRequest) -> Vec<(egui::RichText, AskDecision, bool, &'static str)> {
+    vec![
+        (
+            egui::RichText::new(format!("{} (1)", ask.word1))
+                .monospace()
+                .strong()
+                .color(COLOR_YE),
+            AskDecision::Ye,
+            true,
+            "Оставить «е»",
+        ),
+        (
+            egui::RichText::new(format!("{} (2)", ask.word2))
+                .monospace()
+                .strong()
+                .color(COLOR_YO),
+            AskDecision::Yo,
+            true,
+            "Поставить «ё»",
+        ),
+        (
+            egui::RichText::new("Всегда Е (3)"),
+            AskDecision::YeAll,
+            // Подозрительную «ё» оригинал не разрешал запоминать.
+            !ask.wrong_yo,
+            "Запомнить «е» для этого слова",
+        ),
+        (
+            egui::RichText::new("Всегда Ё (4)"),
+            AskDecision::YoAll,
+            !ask.wrong_yo,
+            "Запомнить «ё» для этого слова",
+        ),
+        (
+            egui::RichText::new("Откат"),
+            AskDecision::Undo,
+            true,
+            "Отменить последнюю замену и остановиться",
+        ),
+        (
+            egui::RichText::new("Прервать (Esc)"),
+            AskDecision::Cancel,
+            true,
+            "Прервать ёфикацию",
+        ),
+    ]
+}
+
+/// Точный размер ряда кнопок: `egui` не центрирует группу сам, поэтому
+/// ширину считаем по тем же галетам и отступам, что использует `Button`.
+fn ask_row_size(
+    ui: &egui::Ui,
+    buttons: &[(egui::RichText, AskDecision, bool, &'static str)],
+) -> egui::Vec2 {
+    let padding = ui.spacing().button_padding;
+    let spacing = ui.spacing().item_spacing.x;
+    let mut size = egui::vec2(0.0, ui.spacing().interact_size.y);
+    for (text, _, _, _) in buttons {
+        let galley = egui::WidgetText::from(text.clone()).into_galley(
+            ui,
+            Some(egui::TextWrapMode::Extend),
+            f32::INFINITY,
+            egui::TextStyle::Button,
+        );
+        size.x += galley.size().x + 2.0 * padding.x;
+        size.y = size.y.max(galley.size().y + 2.0 * padding.y);
+    }
+    size.x += spacing * buttons.len().saturating_sub(1) as f32;
+    size
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1239,7 +1584,7 @@ impl YoApp {
         let mut open = true;
         let mut close = false;
         let title = if self.dialog.is_save {
-            "Сохранить результат"
+            "Сохранить текст"
         } else {
             "Загрузить текст"
         };
@@ -1294,7 +1639,7 @@ impl YoApp {
                         .show(ui, |ui| {
                             for (name, is_dir) in entries {
                                 let label = if is_dir {
-                                    format!("[ {} ]", name)
+                                    format!("[ {name} ]")
                                 } else {
                                     name.clone()
                                 };
@@ -1427,7 +1772,7 @@ impl YoApp {
                 ui.checkbox(&mut o.word_wrap, "Переносить текст по словам");
                 ui.checkbox(&mut o.auto_unicode, "Автораспознавание Unicode");
                 ui.checkbox(&mut o.last_file, "Помнить последний файл");
-                ui.checkbox(&mut self.highlight, "Подсвечивать замены в результате");
+                ui.checkbox(&mut self.highlight, "Подсвечивать замены в тексте");
                 ui.checkbox(&mut self.show_journal, "Вести журнал замен");
 
                 ui.separator();
@@ -1970,4 +2315,402 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(YoApp::new(cc)))),
     )
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Тесты вёрстки
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Проверки интерфейса без окна: `egui::Context` умеет прокручивать кадры
+/// вручную, поэтому вёрстку панели запроса и подсветку слова можно
+/// проверить обычным `cargo test` — ни дисплея, ни GPU не нужно.
+/// Сквозные тесты интерфейса без окна: `YoApp` гоняет настоящий движок в
+/// рабочем потоке, а `pump()` переписывает единственный буфер «на месте».
+#[cfg(test)]
+mod app_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn app() -> YoApp {
+        let ctx = egui::Context::default();
+        YoApp::with_context(&ctx)
+    }
+
+    /// Крутит `pump()` до завершения прогона (или до таймаута).
+    fn wait(app: &mut YoApp) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while app.busy() && Instant::now() < deadline {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(!app.busy(), "прогон не завершился за 20 секунд");
+    }
+
+    #[test]
+    fn run_rewrites_the_single_buffer_in_place() {
+        let mut app = app();
+        app.text = "Актер вышел на сцену.".to_owned();
+        app.text_chars = app.text.chars().count();
+        app.start();
+        assert!(app.busy(), "прогон не начался");
+        wait(&mut app);
+
+        assert_eq!(app.text, "Актёр вышел на сцену.");
+        assert_eq!(
+            app.text.len(),
+            "Актер вышел на сцену.".len(),
+            "длина текста должна сохраняться"
+        );
+        assert_eq!(app.text_chars, "Актер вышел на сцену.".chars().count());
+        assert!(
+            app.run_source.is_none(),
+            "снимок исходника должен освободиться"
+        );
+        assert!(!app.marks.is_empty(), "замена должна попасть в пометки");
+    }
+
+    #[test]
+    fn ask_pauses_the_run_and_points_at_the_word() {
+        let mut app = app();
+        app.opts.always_ask = true;
+        app.text = "Рама, актер.".to_owned();
+        app.text_chars = app.text.chars().count();
+        app.start();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while app.ask.is_none() && Instant::now() < deadline {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let ask = app.ask.clone().expect("движок должен спросить про «актер»");
+        assert_eq!(ask.word1, "актер");
+        assert_eq!(ask.word2, "актёр");
+
+        // GUI должен знать, где это слово в единственном буфере.
+        let (start, end) = app
+            .ask_selection
+            .expect("слово должно найтись в буфере по своим смещениям");
+        let word: String = app.text.chars().skip(start).take(end - start).collect();
+        assert_eq!(word, "актер", "подсветка должна попасть ровно на слово");
+
+        app.answer(AskDecision::Yo);
+        assert!(app.ask.is_none(), "ответ должен снять вопрос");
+        wait(&mut app);
+        assert_eq!(app.text, "Рама, актёр.");
+    }
+
+    #[test]
+    fn stop_keeps_the_text_consistent() {
+        let mut app = app();
+        let source = "Актер вышел на сцену, а ёжик остался дома.".repeat(400);
+        app.text = source.clone();
+        app.text_chars = source.chars().count();
+        app.start();
+        app.stop();
+        wait(&mut app);
+
+        assert_eq!(
+            app.text.chars().count(),
+            source.chars().count(),
+            "после отмены текст не должен ни удлиняться, ни укорачиваться"
+        );
+        assert!(
+            app.status_left.starts_with("прервано"),
+            "статус: {}",
+            app.status_left
+        );
+    }
+}
+
+/// Тесты единственного буфера: именно здесь текст переписывается «на месте».
+#[cfg(test)]
+mod buffer_tests {
+    use super::*;
+
+    const SOURCE: &str = "Актер вышел на сцену.";
+
+    #[test]
+    fn chunk_rewrite_keeps_the_unprocessed_tail() {
+        let mut buffer = SOURCE.to_owned();
+
+        // Движок отдал первое слово — остальное возвращается из исходника.
+        rewrite_in_place(&mut buffer, Some(SOURCE), 0, "Актёр");
+        assert_eq!(buffer, "Актёр вышел на сцену.");
+        assert_eq!(
+            buffer.len(),
+            SOURCE.len(),
+            "длина текста не должна меняться"
+        );
+
+        // Последняя порция приходит в самый конец — хвоста уже нет.
+        rewrite_in_place(&mut buffer, Some(SOURCE), SOURCE.len(), "");
+        assert_eq!(buffer, "Актёр вышел на сцену.");
+    }
+
+    #[test]
+    fn chunk_rewrite_without_a_source_drops_the_tail() {
+        // Прогон закончился — хвост исходника больше не нужен.
+        let mut buffer = SOURCE.to_owned();
+        rewrite_in_place(&mut buffer, None, 0, "Актёр");
+        assert_eq!(buffer, "Актёр");
+    }
+
+    #[test]
+    fn chunk_rewrite_ignores_a_broken_base() {
+        let mut buffer = SOURCE.to_owned();
+        rewrite_in_place(&mut buffer, Some(SOURCE), 3, "…");
+        assert_eq!(
+            buffer, SOURCE,
+            "база не на границе символа — текст не трогаем"
+        );
+        rewrite_in_place(&mut buffer, Some(SOURCE), SOURCE.len() + 1, "…");
+        assert_eq!(buffer, SOURCE, "база за концом буфера — текст не трогаем");
+    }
+}
+
+#[cfg(test)]
+mod gui_tests {
+    use super::*;
+    use egui::{pos2, vec2, Context, RawInput, Rect};
+
+    fn ask() -> AskRequest {
+        AskRequest {
+            word1: "актер".into(),
+            word2: "актёр".into(),
+            before: "Рама, ".into(),
+            after: " вышел".into(),
+            wrong_yo: false,
+            replaced_yo: false,
+            wrong_ye: false,
+            focus_first: true,
+            word_start: 10,
+            word_end: 20,
+        }
+    }
+
+    fn raw(screen: egui::Vec2, time: f64) -> RawInput {
+        RawInput {
+            screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), screen)),
+            time: Some(time),
+            ..Default::default()
+        }
+    }
+
+    fn click_events(pos: egui::Pos2, pressed: bool) -> Vec<egui::Event> {
+        vec![
+            egui::Event::PointerMoved(pos),
+            egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ]
+    }
+
+    /// Прогоняет панель запроса дважды (первый кадр — прогрев шрифтов) и
+    /// возвращает решение вместе с прямоугольником ряда кнопок.
+    fn run_panel(ask: &AskRequest, screen: egui::Vec2) -> (Option<AskDecision>, Rect) {
+        let ctx = Context::default();
+        let mut result = (None, Rect::NOTHING);
+        for frame in 0..2 {
+            let mut inner = (None, Rect::NOTHING);
+            let _ = ctx.run(raw(screen, frame as f64 * 0.016), |ctx| {
+                egui::TopBottomPanel::bottom("ask_panel").show(ctx, |ui| {
+                    inner = ask_panel_ui(ui, ask);
+                });
+            });
+            result = inner;
+        }
+        result
+    }
+
+    #[test]
+    fn ask_row_is_dead_center() {
+        let screen = vec2(1000.0, 700.0);
+        let (_, row) = run_panel(&ask(), screen);
+        assert!(row.width() > 0.0, "ряд кнопок не отрисован");
+        assert!(
+            (row.center().x - screen.x / 2.0).abs() < 0.5,
+            "ряд должен стоять по центру: {:?}, центр экрана {}",
+            row,
+            screen.x / 2.0
+        );
+        assert!(
+            row.width() <= screen.x,
+            "ряд шире окна: {} > {}",
+            row.width(),
+            screen.x
+        );
+    }
+
+    #[test]
+    fn ask_row_stays_inside_a_narrow_window() {
+        // Минимальный размер окна из `NativeOptions`.
+        let screen = vec2(720.0, 480.0);
+        let (_, row) = run_panel(&ask(), screen);
+        assert!(row.width() > 0.0, "ряд кнопок не отрисован");
+        assert!(
+            row.min.x >= 0.0 && row.max.x <= screen.x,
+            "ряд вылез: {row:?}"
+        );
+    }
+
+    #[test]
+    fn ask_buttons_follow_the_original_order() {
+        let buttons = ask_buttons(&ask());
+        let captions: Vec<String> = buttons
+            .iter()
+            .map(|(t, _, _, _)| t.text().to_owned())
+            .collect();
+        assert_eq!(
+            captions,
+            [
+                "актер (1)",
+                "актёр (2)",
+                "Всегда Е (3)",
+                "Всегда Ё (4)",
+                "Откат",
+                "Прервать (Esc)",
+            ]
+        );
+        let decisions: Vec<AskDecision> = buttons.iter().map(|(_, d, _, _)| *d).collect();
+        assert!(matches!(
+            decisions.as_slice(),
+            [
+                AskDecision::Ye,
+                AskDecision::Yo,
+                AskDecision::YeAll,
+                AskDecision::YoAll,
+                AskDecision::Undo,
+                AskDecision::Cancel
+            ]
+        ));
+    }
+
+    #[test]
+    fn suspicious_yo_disables_the_remember_buttons() {
+        // `bYeAll.Enabled := not WrongYo` из Main.pas.
+        let mut a = ask();
+        a.wrong_yo = true;
+        let enabled: Vec<bool> = ask_buttons(&a).iter().map(|(_, _, e, _)| *e).collect();
+        assert_eq!(enabled, [true, true, false, false, true, true]);
+        assert_eq!(ask_title(&a), "Вероятно, здесь должна быть «Е»");
+    }
+
+    #[test]
+    fn ask_titles_match_the_original() {
+        let mut a = ask();
+        assert_eq!(ask_title(&a), "Выберите верный вариант");
+        a.wrong_ye = true;
+        assert_eq!(ask_title(&a), "Вероятно, здесь должна быть «Ё»");
+        a.wrong_ye = false;
+        a.replaced_yo = true;
+        assert_eq!(ask_title(&a), "Странное расположение «Ё»");
+    }
+
+    #[test]
+    fn clicking_a_button_reports_its_decision() {
+        let ctx = Context::default();
+        let screen = vec2(1000.0, 700.0);
+        let a = ask();
+
+        // Пара кадров раскладки: высота нижней панели запоминается с
+        // предыдущего кадра, поэтому позиции кнопок стабильны только со
+        // второго кадра.
+        let mut row = Rect::NOTHING;
+        for frame in 0..2 {
+            let _ = ctx.run(raw(screen, frame as f64 * 0.016), |ctx| {
+                egui::TopBottomPanel::bottom("ask_panel").show(ctx, |ui| {
+                    row = ask_panel_ui(ui, &a).1;
+                });
+            });
+        }
+
+        // Кадры 2 и 3 — нажатие и отпускание на первой кнопке («Е»).
+        let pos = row.left_center() + vec2(row.height() * 0.4, 0.0);
+        let mut clicked = None;
+        for (frame, pressed) in [true, false].into_iter().enumerate() {
+            let mut input = raw(screen, 0.016 * (frame as f64 + 2.0));
+            input.events = click_events(pos, pressed);
+            let _ = ctx.run(input, |ctx| {
+                egui::TopBottomPanel::bottom("ask_panel").show(ctx, |ui| {
+                    let (d, _) = ask_panel_ui(ui, &a);
+                    if d.is_some() {
+                        clicked = d;
+                    }
+                });
+            });
+        }
+
+        assert!(
+            matches!(clicked, Some(AskDecision::Ye)),
+            "клик по первой кнопке должен вернуть Ye, получено {clicked:?}"
+        );
+    }
+
+    /// Подсветка слова в редакторе: `paint_ask_word` рисует плашку ровно под
+    /// словом, даже когда редактор только для чтения и без фокуса.
+    #[test]
+    fn ask_word_is_highlighted_in_the_editor() {
+        let ctx = Context::default();
+        let screen = vec2(800.0, 600.0);
+        let a = ask();
+        let mut text = String::from("Рама, актер вышел на сцену.");
+        let id = text_edit_id();
+        let range = a.char_range(&text).expect("слово должно попадать в текст");
+
+        let mut carets = None;
+        for frame in 0..2 {
+            let _ = ctx.run(raw(screen, frame as f64 * 0.016), |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let out = egui::TextEdit::multiline(&mut text)
+                        .id(id)
+                        .interactive(false)
+                        .show(ui);
+                    paint_ask_word(ui, &out, range);
+                    let s = out
+                        .galley
+                        .pos_from_cursor(&out.galley.from_ccursor(CCursor::new(range.0)))
+                        .translate(out.galley_pos.to_vec2());
+                    let e = out
+                        .galley
+                        .pos_from_cursor(&out.galley.from_ccursor(CCursor::new(range.1)))
+                        .translate(out.galley_pos.to_vec2());
+                    carets = Some((s, e));
+                });
+            });
+        }
+        let (s, e) = carets.expect("кадр не отрисован");
+
+        // Ищем плашку подсветки среди фигур последнего кадра.
+        let out = ctx.run(raw(screen, 0.048), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let out = egui::TextEdit::multiline(&mut text)
+                    .id(id)
+                    .interactive(false)
+                    .show(ui);
+                paint_ask_word(ui, &out, range);
+            });
+        });
+        let plaques: Vec<Rect> = out
+            .shapes
+            .iter()
+            .filter_map(|cs| match &cs.shape {
+                egui::epaint::Shape::Rect(r) if r.fill == COLOR_ASK_BG => Some(r.rect),
+                _ => None,
+            })
+            .collect();
+        assert!(!plaques.is_empty(), "плашка подсветки не нарисована");
+
+        let expected = Rect::from_min_max(
+            pos2(s.left() - 2.0, s.top() - 2.0),
+            pos2(e.left() + 2.0, s.bottom() + 2.0),
+        );
+        assert!(
+            plaques.iter().any(|r| r.intersects(expected)
+                && (r.center().x - expected.center().x).abs() < expected.width() / 2.0),
+            "плашка {plaques:?} не совпала со словом {expected:?}"
+        );
+    }
 }
