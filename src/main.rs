@@ -49,7 +49,6 @@
 
 mod fonts;
 
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -87,7 +86,9 @@ const VERSION: &str = yol::yo_core::YO_VERSION;
 /// файловый режим (он потоковый и ничем не ограничен).
 const MAX_EDITOR_CHARS: usize = 4_000_000;
 
-/// Выше этой длины отключаем подсветку: `LayoutJob` строится за O(меток).
+/// Выше этой длины `LayoutJob` с подсветкой строить дорого —
+// для больших файлов используем оверлей-отрисовку вместо LayoutJob,
+// чтобы ресайз окна не лагал.
 const MAX_HIGHLIGHT_CHARS: usize = 400_000;
 
 /// Ограничение на число запоминаемых пометок в GUI.
@@ -1698,13 +1699,15 @@ impl YoApp {
             // буфер обмена и прислать `Event::Paste` — отдельный `arboard`
             // не нужен.
             let idle = !self.busy();
-            let can_cut = idle && self.has_selection(ctx);
+            let has_sel = self.has_selection(ctx);
+            let can_copy = has_sel;
+            let can_cut = idle && has_sel;
             if Self::menu_item(ui, "Вырезать", "Ctrl+X", can_cut) {
                 ctx.memory_mut(|m| m.request_focus(text_edit_id()));
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestCut);
                 ui.close_menu();
             }
-            if Self::menu_item(ui, "Копировать", "Ctrl+C", can_cut) {
+            if Self::menu_item(ui, "Копировать", "Ctrl+C", can_copy) {
                 if let Some(text) = self.selected_text(ctx) {
                     ctx.copy_text(text);
                 }
@@ -1716,7 +1719,7 @@ impl YoApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
                 ui.close_menu();
             }
-            if Self::menu_item(ui, "Выделить всё", "Ctrl+A", idle) {
+            if Self::menu_item(ui, "Выделить всё", "Ctrl+A", !self.text.is_empty()) {
                 self.select_all(ctx);
                 ui.close_menu();
             }
@@ -1991,23 +1994,28 @@ impl YoApp {
 
             let mut changed = false;
             let mut menu: Option<EditorMenu> = None;
-            // Всё, что нужно контекстному меню, считаем до `TextEdit`:
-            // его `&mut self.text` держится до конца блока.
             let has_sel = self.has_selection(ctx);
             let can_paste = !busy;
             let can_clear = !busy && !self.text.is_empty();
             let ask_plate = color32a(self.ask_plate);
             let ask_underline = self.ask_underline;
+            // Запоминаем выделение до кадра — правый клик не должен его сбрасывать
+            let prev_selection = TextEditState::load(ctx, text_edit_id())
+                .and_then(|s| s.cursor.char_range());
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let edit = egui::TextEdit::multiline(&mut self.text)
+                    // Текстовый редактор должен оставаться выделяемым даже при ёфикации,
+                    // иначе скопировать мышью нельзя. Поэтому interactive всегда true,
+                    // а правку при busy просто игнорируем.
+                    let mut edit_text = self.text.clone();
+                    let edit = egui::TextEdit::multiline(&mut edit_text)
                         .id(text_edit_id())
                         .font(font.font_id())
                         .desired_width(width)
                         .desired_rows(rows)
                         .frame(false)
-                        .interactive(!busy)
+                        .interactive(true)
                         .hint_text(
                             "Вставьте текст или загрузите файл (Файл → Загрузить текст…)",
                         )
@@ -2015,6 +2023,25 @@ impl YoApp {
                         // подсветку замен и синтетический курсив.
                         .layouter(&mut layouter);
                     let out = edit.show(ui);
+
+                    // Правый клик внутри выделения не должен сбрасывать выделение
+                    if ui.ctx().input(|i| i.pointer.secondary_clicked()) {
+                        if let Some(prev) = prev_selection {
+                            if prev.primary.index != prev.secondary.index {
+                                if let Some(mut state) =
+                                    TextEditState::load(ctx, text_edit_id())
+                                {
+                                    let cur = state.cursor.char_range();
+                                    if cur.map_or(true, |r| {
+                                        r.primary.index == r.secondary.index
+                                    }) {
+                                        state.cursor.set_char_range(Some(prev));
+                                        state.store(ctx, text_edit_id());
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     // ── контекстное меню правой кнопки ─────────────────
                     out.response.context_menu(|ui| {
@@ -2042,6 +2069,18 @@ impl YoApp {
                     });
 
                     changed = out.response.changed();
+                    if changed && !busy {
+                        self.text = edit_text.clone();
+                    } else if changed && busy {
+                        // Правку во время ёфикации игнорируем, но сохраняем
+                        // выделение (оно уже в TextEditState)
+                    }
+                    // Для больших файлов (>400k) LayoutJob не красит буквы,
+                    // чтобы ресайз не лагал — рисуем подсветку оверлеем
+                    // (дешевле, только видимые метки).
+                    if !highlighted && !marks.is_empty() {
+                        paint_marks_overlay(ui, &out, &edit_text, marks, mark_bg);
+                    }
                     if let Some(range) = ask_word {
                         // `TextEdit` рисует выделение только в фокусе, а
                         // read-only редактор его не получает — подсвечиваем
@@ -2083,8 +2122,8 @@ impl YoApp {
                 None => {}
             }
 
-            if changed {
-                // Ручная правка делает пометки неверными.
+            if changed && !busy {
+                // Ручная правка делает пометки неверными (во время ёфикации правка игнорируется)
                 self.marks.clear();
                 self.text_chars = self.text.chars().count();
             }
@@ -2546,6 +2585,84 @@ fn paint_ask_word(
     }
 }
 
+/// Оверлей-подсветка для больших файлов: LayoutJob не используем (лагает на ресайзе),
+// рисуем фон меток прямо на galley, только видимые.
+fn paint_marks_overlay(
+    ui: &egui::Ui,
+    out: &egui::widgets::text_edit::TextEditOutput,
+    text: &str,
+    marks: &[(usize, usize)],
+    bg: egui::Color32,
+) {
+    if marks.is_empty() || bg == egui::Color32::TRANSPARENT {
+        return;
+    }
+    let galley = &out.galley;
+    let n_chars = galley.text().chars().count();
+    let painter = ui.painter_at(out.text_clip_rect);
+    let clip = out.text_clip_rect;
+    for &(s, e) in marks {
+        if s >= text.len()
+            || e > text.len()
+            || !text.is_char_boundary(s)
+            || !text.is_char_boundary(e)
+        {
+            continue;
+        }
+        let start = byte_to_char(text, s);
+        let end = byte_to_char(text, e);
+        if start >= end || end > n_chars {
+            continue;
+        }
+        let caret_start = galley
+            .pos_from_cursor(&galley.from_ccursor(CCursor::new(start)))
+            .translate(out.galley_pos.to_vec2());
+        let caret_end = galley
+            .pos_from_cursor(&galley.from_ccursor(CCursor::new(end)))
+            .translate(out.galley_pos.to_vec2());
+        // Cull вне экрана по вертикали
+        let min_y = caret_start.top().min(caret_end.top());
+        let max_y = caret_start.bottom().max(caret_end.bottom());
+        if max_y < clip.top() || min_y > clip.bottom() {
+            continue;
+        }
+        let first = caret_start.center().y;
+        let last = caret_end.center().y;
+        if (first - last).abs() < 0.5 {
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(caret_start.left(), caret_start.top()),
+                egui::pos2(caret_end.left(), caret_start.bottom()),
+            );
+            painter.rect_filled(rect.expand2(egui::vec2(1.0, 0.5)), 1.5, bg);
+        } else {
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(caret_start.left(), caret_start.top()),
+                egui::pos2(galley.rect.right() + out.galley_pos.x, caret_start.bottom()),
+            );
+            if clip.intersects(rect) {
+                painter.rect_filled(rect.expand2(egui::vec2(1.0, 0.5)), 1.5, bg);
+            }
+            for row in galley.rows.iter() {
+                let row_rect = row.rect.translate(out.galley_pos.to_vec2());
+                if row_rect.center().y <= first + 0.5 || row_rect.center().y >= last - 0.5 {
+                    continue;
+                }
+                if !clip.intersects(row_rect) {
+                    continue;
+                }
+                painter.rect_filled(row_rect.expand2(egui::vec2(1.0, 0.5)), 1.5, bg);
+            }
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(out.galley_pos.x, caret_end.top()),
+                egui::pos2(caret_end.left(), caret_end.bottom()),
+            );
+            if clip.intersects(rect) {
+                painter.rect_filled(rect.expand2(egui::vec2(1.0, 0.5)), 1.5, bg);
+            }
+        }
+    }
+}
+
 /// Плашка + подчёркивание: заметно, но текст остаётся читаемым.
 fn paint_word_rect(
     painter: &egui::Painter,
@@ -2639,10 +2756,21 @@ fn ask_panel_ui(
     let mut row = egui::Rect::NOTHING;
 
     ui.add_space(6.0);
-    // Живой контекст слова — вместо статичной подсказки: слева и справа от
-    // спорного слова, как `reAskText`/`FindContext` оригинала. Слово
-    // подсвечено цветом из настроек; строка обрезается по ширине окна.
-    ui.add(egui::Label::new(ask_context_job(ask, ask_text, plate)).truncate());
+    // Живой контекст слова — во всю длину панели и по центру, как на скриншоте:
+    // «хотя мы всё ещё не…» должно быть посередине, а не прижато к левому краю.
+    // Делаем Label selectable, чтобы его тоже можно было скопировать.
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), 18.0),
+        egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+        |ui| {
+            ui.add(
+                egui::Label::new(ask_context_job(ask, ask_text, plate))
+                    .halign(egui::Align::Center)
+                    .selectable(true)
+                    .truncate(),
+            );
+        },
+    );
     ui.add_space(4.0);
     ui.vertical_centered(|ui| {
         egui::Frame::group(ui.style())
@@ -3689,13 +3817,131 @@ impl Args {
     /// Консольный режим: задан файл ввода/вывода, явно указан `-`
     /// (stdin/stdout) либо stdin перенаправлен — `cat файл.txt | yol`.
     ///
-    /// Оговорка: у GUI-приложения, запущенного из .desktop-файла, stdin
-    /// обычно тоже не терминал, поэтому такой запуск нужно помечать `-g`.
+    /// Двойной клик по `yol.exe` на Windows и запуск из ярлыка
+    /// (`.desktop`, `.lnk`) не должны попадать в консольный режим,
+    /// хотя `stdin.is_terminal()` там тоже `false` (у GUI-программы
+    /// вообще нет консоли). Поэтому смотрим не просто «не терминал»,
+    /// а именно «труба/файл» через [`stdin_kind`].
     fn is_cli(&self) -> bool {
+        self.is_cli_with(stdin_kind())
+    }
+
+    /// Вариант [`is_cli`] с явным видом stdin — удобен для тестов.
+    fn is_cli_with(&self, kind: StdinKind) -> bool {
         !self.help
             && !self.version
             && !self.gui
-            && (self.input.is_some() || self.output.is_some() || !std::io::stdin().is_terminal())
+            && (self.input.is_some()
+                || self.output.is_some()
+                || matches!(kind, StdinKind::Pipe | StdinKind::File))
+    }
+}
+
+/// Куда подключён stdin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StdinKind {
+    /// Интерактивный терминал.
+    Terminal,
+    /// `echo foo | yol` или `yol < file`.
+    Pipe,
+    /// Перенаправление из файла (`< file` на некоторых системах даёт File).
+    File,
+    /// Нет консоли и не труба/файл — двойной клик, ярлык, .desktop без терминала.
+    Other,
+}
+
+/// Определить вид stdin без блокировки.
+///
+/// На Unix — по `is_terminal()` и метаданным `/proc/self/fd/0`/`/dev/stdin`,
+/// на Windows — по `GetFileType`/`GetConsoleMode`.
+#[allow(clippy::needless_return)]
+fn stdin_kind() -> StdinKind {
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return StdinKind::Terminal;
+    }
+    #[cfg(unix)]
+    {
+        return stdin_kind_unix();
+    }
+    #[cfg(windows)]
+    {
+        return stdin_kind_windows();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        return StdinKind::Other;
+    }
+}
+
+#[cfg(unix)]
+fn stdin_kind_unix() -> StdinKind {
+    use std::os::unix::fs::FileTypeExt;
+    // Проверяем оба пути: /proc/self/fd/0 точнее, /dev/stdin — запасной.
+    for path in ["/proc/self/fd/0", "/dev/stdin"] {
+        if let Ok(meta) = std::fs::metadata(path) {
+            let ft = meta.file_type();
+            if ft.is_fifo() {
+                return StdinKind::Pipe;
+            }
+            if ft.is_file() {
+                return StdinKind::File;
+            }
+            // Сокет тоже встречается при перенаправлении через сеть
+            #[cfg(target_os = "linux")]
+            {
+                if ft.is_socket() {
+                    return StdinKind::Pipe;
+                }
+            }
+            if ft.is_char_device() {
+                // /dev/null, /dev/zero и т.п. — не считаем CLI
+                // (сюда попадает и двойной клик без консоли)
+                continue;
+            }
+        }
+    }
+    // Fallback: если не смогли определить, но не терминал — считаем Other,
+    // чтобы не открывать консольный режим на двойной клик.
+    StdinKind::Other
+}
+
+#[cfg(windows)]
+mod win_stdin {
+    extern "system" {
+        pub fn GetFileType(hFile: *mut std::ffi::c_void) -> u32;
+        pub fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut u32) -> i32;
+    }
+}
+
+#[cfg(windows)]
+fn stdin_kind_windows() -> StdinKind {
+    use std::os::windows::io::AsRawHandle;
+    let handle = std::io::stdin().as_raw_handle();
+    if handle.is_null() {
+        return StdinKind::Other;
+    }
+    // FILE_TYPE_* из WinBase.h
+    const FILE_TYPE_UNKNOWN: u32 = 0;
+    const FILE_TYPE_DISK: u32 = 1;
+    const FILE_TYPE_CHAR: u32 = 2;
+    const FILE_TYPE_PIPE: u32 = 3;
+    unsafe {
+        let ft = win_stdin::GetFileType(handle as *mut _);
+        match ft {
+            FILE_TYPE_PIPE => StdinKind::Pipe,
+            FILE_TYPE_DISK => StdinKind::File,
+            FILE_TYPE_CHAR => {
+                // Консоль — уже отсеяли is_terminal, но проверим на всякий случай
+                let mut mode: u32 = 0;
+                if win_stdin::GetConsoleMode(handle as *mut _, &mut mode as *mut _) != 0 {
+                    StdinKind::Terminal
+                } else {
+                    // NUL, CON и прочие char-устройства без консоли
+                    StdinKind::Other
+                }
+            }
+            FILE_TYPE_UNKNOWN | _ => StdinKind::Other,
+        }
     }
 }
 
@@ -4655,5 +4901,117 @@ mod helper_tests {
         assert!(read.opts.always_ask);
         assert_eq!(read.recent, vec![PathBuf::from("/tmp/книга.fb2")]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod cli_mode_tests {
+    use super::*;
+
+    fn args_with(input: Option<&str>, output: Option<&str>) -> Args {
+        let mut a = Args {
+            input: input.map(PathBuf::from),
+            output: output.map(PathBuf::from),
+            in_enc: None,
+            out_enc: None,
+            gui: false,
+            quiet: false,
+            opts: YoOptions::default(),
+            help: false,
+            version: false,
+            error: None,
+        };
+        a.opts.ambiguous = AmbiguousPolicy::Ask;
+        a
+    }
+
+    #[test]
+    fn double_click_opens_window_not_cli() {
+        let a = args_with(None, None);
+        assert!(
+            !a.is_cli_with(StdinKind::Other),
+            "двойной клик должен открывать окно, а не консольный режим"
+        );
+        assert!(
+            !a.is_cli_with(StdinKind::Terminal),
+            "терминал без аргументов — тоже окно"
+        );
+    }
+
+    #[test]
+    fn pipe_triggers_cli() {
+        let a = args_with(None, None);
+        assert!(
+            a.is_cli_with(StdinKind::Pipe),
+            "cat file | yol должен идти в консольный режим"
+        );
+    }
+
+    #[test]
+    fn file_redirect_triggers_cli() {
+        let a = args_with(None, None);
+        assert!(
+            a.is_cli_with(StdinKind::File),
+            "yol < file должен идти в консольный режим"
+        );
+    }
+
+    #[test]
+    fn explicit_input_forces_cli_even_on_terminal() {
+        let a = args_with(Some("in.txt"), None);
+        assert!(
+            a.is_cli_with(StdinKind::Terminal),
+            "-i должен форсировать CLI даже в терминале"
+        );
+        assert!(
+            a.is_cli_with(StdinKind::Other),
+            "-i должен форсировать CLI даже при Other"
+        );
+    }
+
+    #[test]
+    fn explicit_output_forces_cli() {
+        let a = args_with(None, Some("out.txt"));
+        assert!(a.is_cli_with(StdinKind::Terminal));
+        assert!(a.is_cli_with(StdinKind::Other));
+    }
+
+    #[test]
+    fn dash_means_explicit_stdio() {
+        let a = args_with(Some("-"), None);
+        assert!(a.is_cli_with(StdinKind::Terminal));
+        let a = Args::parse(["yol".to_string(), "-".to_string()].into_iter());
+        assert!(a.input.is_some());
+        assert!(a.is_cli_with(StdinKind::Terminal));
+    }
+
+    #[test]
+    fn help_and_version_never_cli() {
+        let mut a = args_with(Some("in.txt"), None);
+        a.help = true;
+        assert!(!a.is_cli_with(StdinKind::Pipe), "--help не CLI");
+        a.help = false;
+        a.version = true;
+        assert!(!a.is_cli_with(StdinKind::Pipe), "--version не CLI");
+    }
+
+    #[test]
+    fn gui_flag_forces_window_even_with_pipe() {
+        let mut a = args_with(None, None);
+        a.gui = true;
+        assert!(
+            !a.is_cli_with(StdinKind::Pipe),
+            "-g должен открывать окно даже с трубой"
+        );
+        assert!(!a.is_cli_with(StdinKind::File));
+    }
+
+    #[test]
+    fn stdin_kind_does_not_panic() {
+        let k = stdin_kind();
+        assert!(matches!(
+            k,
+            StdinKind::Terminal | StdinKind::Pipe | StdinKind::File | StdinKind::Other
+        ));
     }
 }
