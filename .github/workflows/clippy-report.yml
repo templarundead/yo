@@ -1,0 +1,77 @@
+name: clippy-report
+on:
+  pull_request:
+    branches: [main, master, develop]
+  push:
+    branches: ["arena/**"]
+  workflow_dispatch:
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux GUI build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libxkbcommon-dev libxcb1-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libwayland-dev libgl1-mesa-dev libglu1-mesa-dev libgtk-3-dev libssl-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Run clippy
+        id: run
+        run: |
+          set +e
+          cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tee clippy.log
+          EC=$?
+          echo "ec=$EC" >> $GITHUB_OUTPUT
+          if [ $EC -eq 0 ]; then echo "clippy ok"; else echo "clippy failed"; fi
+          exit $EC
+        continue-on-error: true
+
+      - name: Post comment on PR
+        if: failure()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let log = '';
+            try { log = fs.readFileSync('clippy.log','utf8'); } catch(e) { log = 'no log'; }
+            if (log.length > 50000) log = log.slice(-50000);
+            // Find PR number for this branch
+            const branch = context.payload.pull_request ? context.payload.pull_request.number : null;
+            let pr = branch;
+            if (!pr) {
+              // try to find PR by head ref
+              const head = context.payload.head_commit ? context.ref : context.ref;
+              const ref = context.ref.replace('refs/heads/','');
+              const { data: prs } = await github.rest.pulls.list({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                head: `${context.repo.owner.login}:${ref}`,
+                state: 'open'
+              });
+              if (prs.length) pr = prs[0].number;
+            }
+            if (!pr) {
+              core.info('No PR found to comment');
+              return;
+            }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr,
+              body: `**clippy log**\n\`\`\`\n${log}\n\`\`\``
+            });
