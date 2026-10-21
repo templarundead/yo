@@ -34,12 +34,14 @@
 // В ядре нет ни одного `unsafe`-блока; атрибут закрепляет это на будущее.
 #![deny(unsafe_code)]
 
+pub mod settings;
 pub mod yo_core;
 
 // Порядок внутри списка как у rustfmt: сначала snake_case-функции,
 // потом типы в CamelCase. `YO_VERSION` намеренно не реэкспортируется:
 // сортировка `YO_VERSION` рядом с `YoOptions` неоднозначна, поэтому
 // константу берут по полному пути — `yol::yo_core::YO_VERSION`.
+pub use settings::{default_ini_path, FontSpec, FontStyle, GuiSettings, Rgb, Rgba, INI_NAME};
 pub use yo_core::{
     clear_user_selections, copy_case, cp1251_char, database_info, decode_bytes, decode_cp1251,
     dictionary, encode_cp1251, encode_string, is_abbreviation_at, is_alpha, is_blank,

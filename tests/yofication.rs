@@ -81,6 +81,15 @@ fn process(input: &str, opts: YoOptions) -> (Collect, Stats) {
     (sink, stats)
 }
 
+/// То же, но с ёфикацией начиная с байтового смещения (`F9`).
+fn process_from(input: &str, from: usize, opts: YoOptions) -> (Collect, Stats) {
+    let mut engine = Engine::new(opts);
+    engine.set_journal(true);
+    let mut sink = Collect::default();
+    let stats = engine.process_from(input, from, &mut sink);
+    (sink, stats)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 //  Единый буфер («на месте», как единственный RichEdit оригинала)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -582,4 +591,90 @@ fn writer_sink_streams_without_holding_the_text() {
     }
     let out = String::from_utf8(buf).expect("результат должен быть корректным UTF-8");
     assert_eq!(out, "ёлка ".repeat(20_000));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Ёфикация с заданной позиции (F9 против Ctrl+F9)
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn process_from_leaves_the_prefix_untouched() {
+    let src = "Актер вышел на сцену. Актер снова вышел.";
+    let from = src.find("Актер снова").expect("вторая половина");
+    let (sink, _) = process_from(src, from, YoOptions::default());
+
+    // Первая половина не тронута, вторая — ёфицирована.
+    assert_eq!(sink.text, "Актер вышел на сцену. Актёр снова вышел.");
+    assert_eq!(sink.text.len(), src.len(), "длина обязана сохраниться");
+}
+
+#[test]
+fn process_from_counts_the_prefix_in_statistics() {
+    let src = "Актер вышел на сцену. Актер снова вышел.";
+    let from = src.find("Актер снова").expect("вторая половина");
+    let (_, stats) = process_from(src, from, YoOptions::default());
+    assert_eq!(
+        stats.chars,
+        src.chars().count() as u64,
+        "префикс тоже считается обработанным"
+    );
+    assert_eq!(stats.checked_changed, 1, "замена только во второй половине");
+}
+
+#[test]
+fn process_from_snaps_to_the_start_of_the_word() {
+    let src = "Актер вышел на сцену.";
+    // «ктер» внутри слова: движок обязан начать с «Актер», иначе получилось
+    // бы «Актер» → «Актёр» с испорченным обрывком.
+    let inside = src.find('к').expect("буква «к»");
+    let (sink, _) = process_from(src, inside, YoOptions::default());
+    assert_eq!(sink.text, "Актёр вышел на сцену.");
+}
+
+#[test]
+fn process_from_at_zero_equals_process() {
+    let src = "Актер вышел на сцену, а береза стояла у елки.";
+    let (a, sa) = process(src, YoOptions::default());
+    let (b, sb) = process_from(src, 0, YoOptions::default());
+    assert_eq!(a.text, b.text);
+    // `elapsed` — единственное поле, которое законно различается.
+    assert_eq!(
+        Stats {
+            elapsed: Default::default(),
+            ..sa
+        },
+        Stats {
+            elapsed: Default::default(),
+            ..sb
+        }
+    );
+}
+
+#[test]
+fn process_from_the_end_changes_nothing() {
+    let src = "Актер вышел на сцену.";
+    let (sink, stats) = process_from(src, src.len(), YoOptions::default());
+    assert_eq!(sink.text, src);
+    assert_eq!(stats.checked_changed, 0);
+    assert_eq!(stats.chars, src.chars().count() as u64);
+}
+
+#[test]
+fn process_from_ignores_an_out_of_range_offset() {
+    let src = "Актер вышел на сцену.";
+    let (sink, _) = process_from(src, src.len() + 100, YoOptions::default());
+    assert_eq!(sink.text, src, "смещение за концом — просто весь текст");
+}
+
+#[test]
+fn custom_databases_are_used_by_the_engine() {
+    // Две разные базы: встроенная и «пустая» — движок обязан взять ту,
+    // которую передали, а не глобальную.
+    let empty = Box::leak(Box::new(yol::yo_core::Dictionary::parse(b"YOX 1.0\n")));
+    let re = yol::yo_core::regex_dictionary();
+    let mut engine = Engine::with_databases(YoOptions::default(), empty, re);
+    let mut sink = Collect::default();
+    let stats = engine.process("Актер вышел на сцену.", &mut sink);
+    assert_eq!(sink.text, "Актер вышел на сцену.");
+    assert_eq!(stats.checked_changed, 0);
 }

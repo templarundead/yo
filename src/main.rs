@@ -1,3 +1,4 @@
+#![windows_subsystem = "windows"]
 //! # YOL — «Ё лайт»
 //!
 //! GUI-часть: главное окно на `egui`/`eframe`, фоновый рабочий поток и
@@ -24,24 +25,54 @@
 //! Главный поток **никогда** не ждёт рабочий: готовый текст приходит порциями
 //! по 64 КБ, статистика — примерно 15 раз в секунду. Поэтому интерфейс не
 //! «фризится» даже на стомегабайтных файлах.
+//!
+//! ## Настройки
+//!
+//! Всё, что можно переключить, живёт в меню «Настройки» (в главном окне нет
+//! ни одного флажка — как в Delphi-оригинале, где опции прятались в диалоге).
+//! Значения хранятся в `yo.ini` рядом с исполняемым файлом и пишутся при
+//! выходе; см. [`yol::settings`].
+//!
+//! ## Горячие клавиши
+//!
+//! | Клавиши | Действие |
+//! |---------|----------|
+//! | `Ctrl+L` | загрузить текст |
+//! | `Ctrl+S` | сохранить как |
+//! | `Ctrl+Alt+S` | сохранить |
+//! | `Ctrl+P` | свойства файла |
+//! | `F9` / `Ctrl+F9` | ёфицировать с текущей позиции / с начала |
+//! | `Shift+F10` | убрать подсветку замен |
+//! | `Ctrl+F`, `Ctrl+R`, `F3` | найти, найти по регулярному выражению, найти снова |
+//! | `Ctrl+W`, `Ctrl+Q` | искать замену вперёд / назад |
+//! | `Esc` | прервать ёфикацию |
+
+mod fonts;
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 use egui::text::{CCursor, CCursorRange};
 use egui::widgets::text_edit::TextEditState;
+use egui::FontFamily;
 
 // Ядро живёт в библиотеке `yol` (src/lib.rs → src/yo_core.rs), а не подключается
 // модулем: так его же можно покрывать интеграционными тестами из tests/.
-use yol::yo_core::{
-    clear_user_selections, database_info, decode_bytes, decode_cp1251, encode_string, preload,
-    utf16_units, AmbiguousPolicy, AskDecision, AskRequest, Engine, Sink, Stats, TextEncoding,
-    YoOptions,
+use yol::settings::{
+    default_ini_path, FontSpec, FontStyle, GuiSettings, Rgb, Rgba, MAX_FONT_SIZE, MAX_RECENT,
+    MIN_FONT_SIZE,
 };
+use yol::yo_core::{
+    copy_case, database_info, decode_bytes, decode_cp1251, encode_string, preload, utf16_units,
+    AmbiguousPolicy, AskDecision, AskRequest, Dictionary, Engine, RegexDict, Sink, Stats,
+    TextEncoding, YoOptions,
+};
+
+use fonts::FontCatalog;
 
 // ═══════════════════════════════════════════════════════════════════════════
 //  Константы интерфейса
@@ -66,15 +97,11 @@ const MAX_GUI_MARKS: usize = 200_000;
 const MAX_JOURNAL: usize = 400;
 
 const COLOR_MARK: egui::Color32 = egui::Color32::from_rgb(255, 208, 96);
-const COLOR_MARK_BG: egui::Color32 = egui::Color32::from_rgb(96, 62, 12);
 const COLOR_YE: egui::Color32 = egui::Color32::from_rgb(120, 190, 255);
 const COLOR_YO: egui::Color32 = egui::Color32::from_rgb(150, 240, 150);
 const COLOR_DIM: egui::Color32 = egui::Color32::from_rgb(150, 150, 160);
 /// «Тревожный» заголовок панели запроса (в оригинале — `clRed`).
 const COLOR_ALERT: egui::Color32 = egui::Color32::from_rgb(255, 120, 120);
-
-/// Плашка под спорным словом: полупрозрачная, чтобы буквы оставались видны.
-const COLOR_ASK_BG: egui::Color32 = egui::Color32::from_rgba_premultiplied(70, 52, 10, 70);
 
 /// Постоянный id единого редактора: по нему `TextEditState` находит выделение,
 /// которым GUI отмечает спорное слово — аналог `Editor.SelStart/SelLength`.
@@ -202,14 +229,48 @@ impl Sink for GuiSink<'_> {
 //  Встроенный диалог работы с файлами (без GTK/WinAPI — чистый std::fs)
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// Что выбирает диалог файла: текст, словарь, регулярные выражения или шрифт.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FilePurpose {
+    Text,
+    Dictionary,
+    RegexDictionary,
+    Font,
+}
+
+impl FilePurpose {
+    /// Расширения, которые имеет смысл показывать.
+    fn extensions(self) -> &'static [&'static str] {
+        match self {
+            FilePurpose::Text => &["txt", "fb2", "rtf", "md", "log", "ini", "csv"],
+            FilePurpose::Dictionary => &["dat", "txt"],
+            FilePurpose::RegexDictionary => &["dat", "txt"],
+            FilePurpose::Font => &["ttf", "otf"],
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            FilePurpose::Text => "Загрузить текст",
+            FilePurpose::Dictionary => "Загрузить основной словарь",
+            FilePurpose::RegexDictionary => "Загрузить словарь регулярных выражений",
+            FilePurpose::Font => "Загрузить шрифт",
+        }
+    }
+}
+
 enum FileAction {
     Load(PathBuf, TextEncoding),
     Save(PathBuf, TextEncoding),
+    OpenDictionary(PathBuf),
+    OpenRegexDictionary(PathBuf),
+    OpenFont(PathBuf),
 }
 
 struct FileDialog {
     open: bool,
     is_save: bool,
+    purpose: FilePurpose,
     dir: PathBuf,
     name: String,
     entries: Vec<(String, bool)>,
@@ -223,6 +284,7 @@ impl FileDialog {
         let mut d = Self {
             open: false,
             is_save: false,
+            purpose: FilePurpose::Text,
             dir,
             name: String::new(),
             entries: Vec::new(),
@@ -241,24 +303,41 @@ impl FileDialog {
         self.dir.join(&self.name)
     }
 
-    fn open_for_load(&mut self) {
+    /// Открыть диалог на чтение файла нужного назначения.
+    fn open_for(&mut self, purpose: FilePurpose, dir: Option<&Path>) {
         self.open = true;
         self.is_save = false;
+        self.purpose = purpose;
         self.status.clear();
+        if let Some(dir) = dir.filter(|d| d.is_dir()) {
+            self.dir = dir.to_path_buf();
+        }
         self.refresh();
     }
 
     fn open_for_save(&mut self, suggested: &str) {
         self.open = true;
         self.is_save = true;
+        self.purpose = FilePurpose::Text;
         self.status.clear();
         self.name = suggested.to_owned();
         self.refresh();
     }
+
+    fn title(&self) -> &'static str {
+        if self.is_save {
+            "Сохранить текст"
+        } else {
+            self.purpose.title()
+        }
+    }
 }
 
 /// Содержимое каталога: сначала папки, потом файлы, всё по алфавиту.
-fn list_dir(dir: &Path) -> Vec<(String, bool)> {
+///
+/// `Some(exts)` оставляет только файлы с перечисленными расширениями
+/// (папки показываются всегда — иначе из каталога не выбраться).
+fn list_dir_filtered(dir: &Path, exts: Option<&[&str]>) -> Vec<(String, bool)> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -272,6 +351,14 @@ fn list_dir(dir: &Path) -> Vec<(String, bool)> {
         let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
         if is_dir {
             dirs.push(name);
+        } else if let Some(exts) = exts {
+            let ext = Path::new(&name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_ascii_lowercase());
+            if ext.as_deref().is_some_and(|e| exts.contains(&e)) {
+                files.push(name);
+            }
         } else {
             files.push(name);
         }
@@ -282,6 +369,43 @@ fn list_dir(dir: &Path) -> Vec<(String, bool)> {
         .map(|n| (n, true))
         .chain(files.into_iter().map(|n| (n, false)))
         .collect()
+}
+
+/// Содержимое каталога без фильтра по расширениям.
+fn list_dir(dir: &Path) -> Vec<(String, bool)> {
+    list_dir_filtered(dir, None)
+}
+
+/// Корни файловой системы: диски на Windows, точки монтирования на Unix.
+///
+/// Без этого список файлов умел ходить только вверх по текущему дереву —
+/// переключиться с `C:` на `D:` из диалога было нельзя.
+fn system_roots() -> Vec<(String, PathBuf)> {
+    let mut roots: Vec<(String, PathBuf)> = Vec::new();
+    if cfg!(windows) {
+        for c in b'A'..=b'Z' {
+            let path = PathBuf::from(format!("{}:\\", c as char));
+            if path.is_dir() {
+                roots.push((format!("{}:", c as char), path));
+            }
+        }
+    } else {
+        roots.push(("/".to_owned(), PathBuf::from("/")));
+        for dir in ["/mnt", "/media", "/home", "/usr/local", "/opt", "/tmp"] {
+            let path = PathBuf::from(dir);
+            if path.is_dir() {
+                roots.push((dir.to_owned(), path));
+            }
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let path = PathBuf::from(home);
+            if path.is_dir() {
+                let label = format!("~ ({})", path.display());
+                roots.push((label, path));
+            }
+        }
+    }
+    roots
 }
 
 /// Декодировать с явным указанием формата (без BOM-эвристики).
@@ -302,6 +426,170 @@ fn decode_with(bytes: &[u8], enc: TextEncoding) -> String {
                 (0, enc == TextEncoding::Utf16Le)
             };
             String::from_utf16_lossy(&utf16_units(&bytes[skip..], le))
+        }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Шрифт, поиск и свойства файла
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Имя, под которым внешний шрифт регистрируется в egui.
+const EDITOR_FONT_KEY: &str = "yol_editor_face";
+
+/// Разрешённый шрифт редактора.
+#[derive(Clone, Debug)]
+struct EditorFont {
+    family: FontFamily,
+    size: f32,
+    /// Курсив придётся синтезировать (у файла нет курсивного начертания).
+    italics: bool,
+}
+
+impl EditorFont {
+    fn font_id(&self) -> egui::FontId {
+        egui::FontId::new(self.size, self.family.clone())
+    }
+}
+
+/// Встроенное семейство по имени из настроек.
+fn builtin_family(name: &str) -> FontFamily {
+    match name {
+        "Hack" | "Monospace" | "Моноширинный" => FontFamily::Monospace,
+        _ => FontFamily::Proportional,
+    }
+}
+
+/// Собрать [`egui::FontDefinitions`]: встроенные семейства плюс (если задан)
+/// внешний файл шрифта.
+fn build_font_definitions(spec: &FontSpec) -> (egui::FontDefinitions, ResolvedFont) {
+    let mut fonts = egui::FontDefinitions::default();
+    let mut family = builtin_family(&spec.family);
+    let mut italics = spec.style.is_italic();
+    let mut loaded = None;
+
+    if let Some(file) = &spec.file {
+        if let Ok(bytes) = std::fs::read(file) {
+            if let Some(names) = fonts::read_face_names(&bytes) {
+                // Курсив уже есть в самом файле — синтезировать не нужно.
+                italics = spec.style.is_italic() && !names.style.is_italic();
+            }
+            fonts.font_data.insert(
+                EDITOR_FONT_KEY.to_owned(),
+                Arc::new(egui::FontData::from_owned(bytes)),
+            );
+            // Основной шрифт плюс Ubuntu-Light как запасной для недостающих
+            // глифов (стрелки, знак номера и т.п.).
+            fonts.families.insert(
+                FontFamily::Name(EDITOR_FONT_KEY.into()),
+                vec![EDITOR_FONT_KEY.to_owned(), "Ubuntu-Light".to_owned()],
+            );
+            family = FontFamily::Name(EDITOR_FONT_KEY.into());
+            loaded = Some(file.clone());
+        }
+    }
+
+    (
+        fonts,
+        ResolvedFont {
+            family,
+            italics,
+            loaded,
+        },
+    )
+}
+
+/// Вспомогательная структура: что получилось из [`build_font_definitions`].
+struct ResolvedFont {
+    family: FontFamily,
+    italics: bool,
+    loaded: Option<PathBuf>,
+}
+
+/// Применить шрифты к контексту и вернуть разрешённый [`EditorFont`].
+fn install_fonts(ctx: &egui::Context, spec: &FontSpec) -> EditorFont {
+    let (fonts, resolved) = build_font_definitions(spec);
+    ctx.set_fonts(fonts);
+    let _ = resolved.loaded;
+    EditorFont {
+        family: resolved.family,
+        size: spec.size,
+        italics: resolved.italics,
+    }
+}
+
+/// Загрузить внешний словарь. Живёт до конца процесса (их единицы за сеанс).
+fn load_dictionary(path: &Path) -> Option<&'static Dictionary> {
+    let bytes = std::fs::read(path).ok()?;
+    let dict = Dictionary::parse(&bytes);
+    if dict.is_empty() {
+        return None;
+    }
+    Some(Box::leak(Box::new(dict)))
+}
+
+/// Загрузить внешний словарь регулярных выражений.
+fn load_regex_dictionary(path: &Path) -> Option<&'static RegexDict> {
+    let bytes = std::fs::read(path).ok()?;
+    let dict = RegexDict::parse(&bytes);
+    if dict.is_empty() {
+        return None;
+    }
+    Some(Box::leak(Box::new(dict)))
+}
+
+/// Что выбрал пользователь в контекстном меню редактора.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorMenu {
+    Copy,
+    Paste,
+    Clear,
+}
+
+/// Состояние поиска по тексту.
+#[derive(Default, Clone, Debug)]
+struct FindState {
+    query: String,
+    /// Искать как регулярное выражение.
+    regex: bool,
+    case_sensitive: bool,
+    error: Option<String>,
+    /// Последнее найденное совпадение — в индексах символов.
+    last: Option<(usize, usize)>,
+}
+
+/// Сведения о загруженном файле («Файл → Свойства файла»).
+#[derive(Clone, Debug)]
+struct FileProps {
+    path: Option<PathBuf>,
+    exists: bool,
+    size: u64,
+    modified: Option<SystemTime>,
+    encoding: TextEncoding,
+    chars: usize,
+    words: usize,
+    lines: usize,
+}
+
+impl FileProps {
+    fn collect(path: Option<&Path>, text: &str, encoding: TextEncoding) -> Self {
+        let meta = path.and_then(|p| std::fs::metadata(p).ok());
+        Self {
+            path: path.map(Path::to_path_buf),
+            exists: meta.is_some(),
+            size: meta.as_ref().map(|m| m.len()).unwrap_or(0),
+            modified: meta.and_then(|m| m.modified().ok()),
+            encoding,
+            chars: text.chars().count(),
+            words: text
+                .split(|c: char| !yol::yo_core::is_alpha(c))
+                .filter(|w| !w.is_empty())
+                .count(),
+            lines: if text.is_empty() {
+                0
+            } else {
+                text.lines().count().max(1)
+            },
         }
     }
 }
@@ -353,26 +641,89 @@ struct YoApp {
     /// Какой файл сейчас загружен (для «Сохранить» без диалога).
     current_file: Option<PathBuf>,
     current_encoding: TextEncoding,
+
+    // ── настройки и оформление ──────────────────────────────────────────
+    /// Откуда читать и куда писать `yo.ini`; `None` — не сохранять вовсе
+    /// (так живут тесты и встраиваемые сборки).
+    config_path: Option<PathBuf>,
+    /// Редактор: семейство, файл, начертание, размер.
+    font_spec: FontSpec,
+    /// Разрешённый `FontId` и признак синтетического курсива.
+    editor_font: EditorFont,
+    /// Найденные системные шрифты (скан ленивый — при открытии диалога).
+    font_catalog: FontCatalog,
+    font_catalog_scanned: bool,
+
+    mark_text: Rgb,
+    mark_bg: Rgb,
+    ask_text: Rgb,
+    ask_plate: Rgba,
+    ask_underline: f32,
+
+    /// Последние открытые файлы (свежие первыми).
+    recent: Vec<PathBuf>,
+
+    // ── поиск ───────────────────────────────────────────────────────────
+    show_find: bool,
+    find: FindState,
+    /// К какому символу прокрутить редактор на ближайшем кадре.
+    scroll_to_selection: Option<usize>,
+
+    // ── окна ────────────────────────────────────────────────────────────
+    show_font_dialog: bool,
+    show_colors: bool,
+    show_props: bool,
+    props: Option<FileProps>,
+
+    // ── словари ─────────────────────────────────────────────────────────
+    /// Внешний основной словарь (если загружен пользователем).
+    dict_override: Option<&'static Dictionary>,
+    /// Внешний словарь регулярных выражений.
+    re_override: Option<&'static RegexDict>,
+    /// Откуда они взяты — эти пути уходят в `yo.ini`.
+    dictionary_path: Option<PathBuf>,
+    regex_dict_path: Option<PathBuf>,
 }
 
 impl YoApp {
+    /// Настоящий запуск: настройки читаются из `yo.ini` рядом с бинарником.
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        Self::with_context(&cc.egui_ctx)
+        let path = default_ini_path();
+        let settings = GuiSettings::load(&path);
+        Self::with_settings(&cc.egui_ctx, settings, Some(path))
     }
 
-    /// Сборка приложения с готовым `egui::Context`: так `YoApp` можно поднять
-    /// и в тестах, где окна нет вовсе.
+    /// Сборка приложения с готовым `egui::Context` и настройками по умолчанию:
+    /// так `YoApp` поднимают тесты, где ни окна, ни `yo.ini` нет.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn with_context(ctx: &egui::Context) -> Self {
-        // Тёмная тема — сразу и по умолчанию.
-        setup_fonts(ctx);
-        apply_theme(ctx, true);
+        Self::with_settings(ctx, GuiSettings::default(), None)
+    }
 
+    /// Общий конструктор: применяет тему и шрифты, подхватывает внешние
+    /// словари и (если включено) последний открытый файл.
+    fn with_settings(
+        ctx: &egui::Context,
+        settings: GuiSettings,
+        config_path: Option<PathBuf>,
+    ) -> Self {
         // Словари (1.8 МБ) разбираем в фоне: окно появляется мгновенно,
         // а первый прогон всё равно дождётся готовности базы.
         std::thread::spawn(preload);
 
-        Self {
-            opts: YoOptions::default(),
+        apply_theme(ctx, settings.dark);
+        let editor_font = install_fonts(ctx, &settings.font);
+
+        // Внешние базы, выбранные в прошлый раз, читаем сразу: без них
+        // первый прогон дал бы не те замены.
+        let dict_override = settings.dictionary.as_deref().and_then(load_dictionary);
+        let re_override = settings
+            .regex_dictionary
+            .as_deref()
+            .and_then(load_regex_dictionary);
+
+        let mut app = Self {
+            opts: settings.opts.clone(),
             text: String::new(),
             text_chars: 0,
             run_source: None,
@@ -386,16 +737,82 @@ impl YoApp {
             stats: Stats::default(),
             dict_info: None,
             status_left: "готов — вставьте текст или загрузите файл".to_owned(),
-            dark: true,
-            applied_dark: None,
-            highlight: true,
-            show_journal: false,
+            dark: settings.dark,
+            applied_dark: Some(settings.dark),
+            highlight: settings.highlight,
+            show_journal: settings.show_journal,
             show_options: false,
             show_about: false,
             show_stats: false,
             dialog: FileDialog::new(),
             current_file: None,
             current_encoding: TextEncoding::Utf8Bom,
+            config_path,
+            font_spec: settings.font.clone(),
+            editor_font,
+            font_catalog: FontCatalog::default(),
+            font_catalog_scanned: false,
+            mark_text: settings.mark_text,
+            mark_bg: settings.mark_bg,
+            ask_text: settings.ask_text,
+            ask_plate: settings.ask_plate,
+            ask_underline: settings.ask_underline,
+            recent: settings.recent.clone(),
+            show_find: false,
+            find: FindState::default(),
+            scroll_to_selection: None,
+            show_font_dialog: false,
+            show_colors: false,
+            show_props: false,
+            props: None,
+            dict_override,
+            re_override,
+            dictionary_path: settings.dictionary.clone(),
+            regex_dict_path: settings.regex_dictionary.clone(),
+        };
+
+        // «Помнить последний файл» — как `RecallLastFile` оригинала.
+        if app.opts.last_file {
+            if let Some(path) = settings.last_file.clone().filter(|p| p.is_file()) {
+                app.load_path(path, None);
+            }
+        }
+        app
+    }
+
+    /// Снимок настроек для записи в `yo.ini`.
+    fn settings_snapshot(&self) -> GuiSettings {
+        GuiSettings {
+            opts: self.opts.clone(),
+            dark: self.dark,
+            highlight: self.highlight,
+            show_journal: self.show_journal,
+            font: self.font_spec.clone(),
+            mark_text: self.mark_text,
+            mark_bg: self.mark_bg,
+            ask_text: self.ask_text,
+            ask_plate: self.ask_plate,
+            ask_underline: self.ask_underline,
+            recent: self.recent.clone(),
+            // Если файл ещё не открывали, не теряем прошлый «последний».
+            last_file: self
+                .current_file
+                .clone()
+                .or_else(|| self.recent.first().cloned()),
+            dictionary: self.dictionary_path.clone(),
+            regex_dictionary: self.regex_dict_path.clone(),
+        }
+    }
+
+    /// Записать `yo.ini`. Ошибка не фатальна — показываем её в строке
+    /// состояния, чтобы пользователь знал, что настройки не сохранились.
+    fn save_settings(&mut self) {
+        let Some(path) = self.config_path.clone() else {
+            return;
+        };
+        let settings = self.settings_snapshot();
+        if let Err(e) = settings.save(&path) {
+            self.status_left = format!("не удалось сохранить {}: {e}", path.display());
         }
     }
 
@@ -408,13 +825,24 @@ impl YoApp {
     //  Запуск / остановка / обмен с рабочим потоком
     // ────────────────────────────────────────────────────────────────────
 
+    /// Ёфицировать с начала текста (`Ctrl+F9`).
     fn start(&mut self) {
+        self.start_at(0);
+    }
+
+    /// Ёфицировать с байтового смещения `from` (`F9` — с текущей позиции).
+    fn start_at(&mut self, from: usize) {
         if self.busy() {
             return;
         }
         if self.text.is_empty() {
             self.status_left = "нечего ёфицировать".to_owned();
             return;
+        }
+        // Движок не умеет начинать посреди символа.
+        let mut from = from.min(self.text.len());
+        while from > 0 && !self.text.is_char_boundary(from) {
+            from -= 1;
         }
 
         let (tx, rx) = mpsc::channel::<Event>();
@@ -429,26 +857,35 @@ impl YoApp {
         let want_journal = self.show_journal;
         let cancel_thread = cancel.clone();
         let total_chars = self.text_chars;
+        // Активные базы: встроенные или загруженные пользователем.
+        let dict = self.dict_override.unwrap_or_else(yol::yo_core::dictionary);
+        let re = self
+            .re_override
+            .unwrap_or_else(yol::yo_core::regex_dictionary);
 
         std::thread::spawn(move || {
-            let t0 = Instant::now();
-            let (words, dic_version, rules, re_version) = database_info();
+            let (words, dic_version, rules, re_version) = (
+                dict.len(),
+                dict.version().to_owned(),
+                re.len(),
+                re.version().to_owned(),
+            );
             let _ = tx.send(Event::Ready {
                 words,
                 dic_version,
                 rules,
                 re_version,
-                elapsed_ms: t0.elapsed().as_millis(),
+                elapsed_ms: 0,
             });
 
-            let mut engine = Engine::new(opts);
+            let mut engine = Engine::with_databases(opts, dict, re);
             engine.set_journal(want_journal);
             let mut sink = GuiSink {
                 tx: &tx,
                 rx: &ans_rx,
                 cancel: &cancel_thread,
             };
-            let stats = engine.process(engine_input.as_str(), &mut sink);
+            let stats = engine.process_from(engine_input.as_str(), from, &mut sink);
             let _ = tx.send(Event::Done { stats });
         });
 
@@ -466,7 +903,11 @@ impl YoApp {
             cancel,
             total_chars,
         });
-        self.status_left = "ёфикация…".to_owned();
+        self.status_left = if from == 0 {
+            "ёфикация с начала текста…".to_owned()
+        } else {
+            format!("ёфикация с позиции {from}…")
+        };
     }
 
     fn stop(&mut self) {
@@ -614,10 +1055,9 @@ impl YoApp {
 
     /// Ответить рабочему потоку на панель запроса.
     fn answer(&mut self, decision: AskDecision) {
-        let tx = match &self.run {
-            Some(r) => r.ans_tx.clone(),
-            None => return,
-        };
+        // Вопрос мог быть поднят и без прогона («Искать замену»): тогда
+        // отвечать движку некому, но журнал и состояние обновить нужно.
+        let tx = self.run.as_ref().map(|r| r.ans_tx.clone());
         if self.ask.is_none() {
             // Вопрос уже снят (кнопку нажали в этом же кадре, а следом
             // прилетела горячая клавиша) — второй ответ движку не нужен.
@@ -641,7 +1081,9 @@ impl YoApp {
         if let Some((start, _)) = self.ask_selection.take() {
             self.selection_after = Some(start);
         }
-        let _ = tx.send(decision);
+        if let Some(tx) = tx {
+            let _ = tx.send(decision);
+        }
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -667,6 +1109,7 @@ impl YoApp {
                 self.journal.clear();
                 self.current_file = Some(path.clone());
                 self.current_encoding = detected;
+                self.remember_file(&path);
                 self.status_left = format!(
                     "загружено: {} · {} · {} симв.",
                     path.file_name().unwrap_or_default().to_string_lossy(),
@@ -684,6 +1127,7 @@ impl YoApp {
             Ok(()) => {
                 self.current_file = Some(path.clone());
                 self.current_encoding = enc;
+                self.remember_file(&path);
                 self.status_left = format!(
                     "сохранено: {} · {}",
                     path.file_name().unwrap_or_default().to_string_lossy(),
@@ -693,534 +1137,336 @@ impl YoApp {
             Err(e) => self.status_left = format!("ошибка записи: {e}"),
         }
     }
-}
 
-// ═══════════════════════════════════════════════════════════════════════════
-//  Шрифты и стиль
-// ═══════════════════════════════════════════════════════════════════════════
+    // ────────────────────────────────────────────────────────────────────
+    //  Файлы, буфер и свойства
+    // ────────────────────────────────────────────────────────────────────
 
-/// Гарантируем кириллицу в моноширинном шрифте: в egui `Monospace` по
-/// умолчанию — Хэк, которого в минимальных сборках может не быть с кириллицей.
-/// Подменяем его тем же набором, что у `Proportional` (Ubuntu-Light покрывает
-/// кириллицу полностью).
-fn setup_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    if let Some(names) = fonts.families.get(&egui::FontFamily::Proportional).cloned() {
-        fonts.families.insert(egui::FontFamily::Monospace, names);
-    }
-    ctx.set_fonts(fonts);
-}
-
-/// Тема + стиль. `set_visuals` заменяет `Visuals` **целиком**, поэтому стиль
-/// накладывается строго после него — иначе скругления виджетов сбрасываются.
-fn apply_theme(ctx: &egui::Context, dark: bool) {
-    ctx.set_visuals(if dark {
-        egui::Visuals::dark()
-    } else {
-        egui::Visuals::light()
-    });
-    setup_style(ctx);
-}
-
-/// Современная «тёмная» подача: скругления, воздух, читаемый кегль.
-fn setup_style(ctx: &egui::Context) {
-    ctx.style_mut(|style| {
-        let r = egui::CornerRadius::same(6);
-        style.visuals.widgets.noninteractive.corner_radius = r;
-        style.visuals.widgets.inactive.corner_radius = r;
-        style.visuals.widgets.hovered.corner_radius = r;
-        style.visuals.widgets.active.corner_radius = r;
-        style.visuals.widgets.open.corner_radius = r;
-        style.visuals.window_corner_radius = egui::CornerRadius::same(10);
-        style.visuals.menu_corner_radius = egui::CornerRadius::same(8);
-        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-        style.spacing.button_padding = egui::vec2(10.0, 5.0);
-
-        // `fn_call_width` у rustfmt по умолчанию 60, поэтому аргументы
-        // записываем вертикально — так файл остаётся стабильным под `cargo fmt`.
-        let ts = &mut style.text_styles;
-        ts.insert(
-            egui::TextStyle::Small,
-            egui::FontId::new(12.0, egui::FontFamily::Proportional),
-        );
-        ts.insert(
-            egui::TextStyle::Body,
-            egui::FontId::new(14.0, egui::FontFamily::Proportional),
-        );
-        ts.insert(
-            egui::TextStyle::Button,
-            egui::FontId::new(14.0, egui::FontFamily::Proportional),
-        );
-        ts.insert(
-            egui::TextStyle::Heading,
-            egui::FontId::new(19.0, egui::FontFamily::Proportional),
-        );
-        ts.insert(
-            egui::TextStyle::Monospace,
-            egui::FontId::new(14.5, egui::FontFamily::Monospace),
-        );
-    });
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Реализация eframe::App
-// ═══════════════════════════════════════════════════════════════════════════
-
-impl eframe::App for YoApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Тёмная тема — принудительно (по умолчанию). `set_visuals` каждый кадр
-        // клонировал бы Arc<Style>, поэтому применяем только при смене режима.
-        if self.applied_dark != Some(self.dark) {
-            apply_theme(ctx, self.dark);
-            self.applied_dark = Some(self.dark);
+    /// Открыть диалог загрузки текста в папке текущего файла.
+    fn open_load_dialog(&mut self) {
+        let dir = self
+            .current_file
+            .as_deref()
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf);
+        self.dialog.open_for(FilePurpose::Text, dir.as_deref());
+        if let Some(name) = self
+            .current_file
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+        {
+            self.dialog.name = name.to_owned();
         }
+        self.dialog.encoding = self.current_encoding;
+    }
 
-        self.pump();
+    /// «Сохранить» (`ask == false`) или «Сохранить как» (`ask == true`).
+    fn save_text(&mut self, ask: bool) {
         if self.busy() {
-            // Иначе egui не будет перерисовываться, пока не придёт ввод.
-            ctx.request_repaint();
-            // Esc без вопроса — «Прервать», как в оригинале.
-            if self.ask.is_none() && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                self.stop();
-            }
-        }
-
-        self.menu_bar(ctx);
-        self.options_strip(ctx);
-        // Нижние панели накладываются в порядке вызова: первая — самая нижняя.
-        self.status_bar(ctx);
-        if self.ask.is_some() {
-            self.ask_panel(ctx);
-        }
-        self.editor_panel(ctx);
-
-        self.file_dialog_window(ctx);
-        self.options_window(ctx);
-        self.about_window(ctx);
-        self.stats_window(ctx);
-        if self.show_journal {
-            self.journal_window(ctx);
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════════
-//  Отрисовка
-// ═══════════════════════════════════════════════════════════════════════════
-
-impl YoApp {
-    // ── главное меню ───────────────────────────────────────────────────
-    fn menu_bar(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
-                ui.menu_button("Файл", |ui| {
-                    if ui.button("Загрузить текст…").clicked() {
-                        self.dialog.open_for_load();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.busy() && !self.text.is_empty(),
-                            egui::Button::new("Сохранить текст…"),
-                        )
-                        .clicked()
-                    {
-                        let suggested = self
-                            .current_file
-                            .as_ref()
-                            .and_then(|p| p.file_name())
-                            .map(|n| format!("yo_{}", n.to_string_lossy()))
-                            .unwrap_or_else(|| "yofied.txt".to_owned());
-                        self.dialog.encoding = self.current_encoding;
-                        self.dialog.open_for_save(&suggested);
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if let Some(path) = &self.current_file {
-                        ui.label(
-                            egui::RichText::new(path.to_string_lossy().into_owned())
-                                .small()
-                                .color(COLOR_DIM),
-                        );
-                    }
-                    ui.separator();
-                    if ui.button("Выход").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
-                });
-
-                ui.menu_button("Правка", |ui| {
-                    // Ctrl+X / Ctrl+C / Ctrl+V обслуживает сам `TextEdit`
-                    // (нативные события egui). Пунктам меню достаточно
-                    // попросить об этом eframe: `RequestPaste` заставляет
-                    // интеграцию прочитать системный буфер обмена и прислать
-                    // `Event::Paste` — отдельный `arboard` не нужен.
-                    let idle = !self.busy();
-                    let can_cut = idle && self.has_selection(ctx);
-                    if ui
-                        .add_enabled(can_cut, egui::Button::new("Вырезать"))
-                        .on_hover_text("Ctrl+X")
-                        .clicked()
-                    {
-                        ctx.memory_mut(|m| m.request_focus(text_edit_id()));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::RequestCut);
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(can_cut, egui::Button::new("Копировать"))
-                        .on_hover_text("Ctrl+C")
-                        .clicked()
-                    {
-                        ctx.memory_mut(|m| m.request_focus(text_edit_id()));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::RequestCopy);
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(idle, egui::Button::new("Вставить"))
-                        .on_hover_text("Ctrl+V")
-                        .clicked()
-                    {
-                        ctx.memory_mut(|m| m.request_focus(text_edit_id()));
-                        ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(idle, egui::Button::new("Выделить всё"))
-                        .on_hover_text("Ctrl+A")
-                        .clicked()
-                    {
-                        self.select_all(ctx);
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(
-                            !self.text.is_empty(),
-                            egui::Button::new("Копировать весь текст"),
-                        )
-                        .clicked()
-                    {
-                        ctx.copy_text(self.text.clone());
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui
-                        .add_enabled(
-                            idle && !self.text.is_empty(),
-                            egui::Button::new("Очистить всё"),
-                        )
-                        .clicked()
-                    {
-                        self.text.clear();
-                        self.text_chars = 0;
-                        self.marks.clear();
-                        self.journal.clear();
-                        self.ask_selection = None;
-                        self.selection_after = None;
-                        ui.close_menu();
-                    }
-                });
-
-                ui.menu_button("Ёфикация", |ui| {
-                    if ui
-                        .add_enabled(
-                            !self.busy() && !self.text.is_empty(),
-                            egui::Button::new("Ёфицировать"),
-                        )
-                        .clicked()
-                    {
-                        self.start();
-                        ui.close_menu();
-                    }
-                    if ui
-                        .add_enabled(self.busy(), egui::Button::new("Прервать"))
-                        .clicked()
-                    {
-                        self.stop();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Сбросить «всегда Е/Ё»").clicked() {
-                        clear_user_selections();
-                        self.status_left = "память ответов очищена".to_owned();
-                        ui.close_menu();
-                    }
-                });
-
-                ui.menu_button("Настройки", |ui| {
-                    if ui.checkbox(&mut self.dark, "Тёмная тема").clicked() {
-                        ui.close_menu();
-                    }
-                    if ui
-                        .checkbox(&mut self.show_journal, "Журнал замен")
-                        .clicked()
-                    {
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Все опции…").clicked() {
-                        self.show_options = true;
-                        ui.close_menu();
-                    }
-                });
-
-                ui.menu_button("Помощь", |ui| {
-                    if ui.button("Статистика…").clicked() {
-                        self.show_stats = true;
-                        ui.close_menu();
-                    }
-                    if ui.button("О программе").clicked() {
-                        self.show_about = true;
-                        ui.close_menu();
-                    }
-                });
-
-                ui.with_layout(
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| match &self.dict_info {
-                        Some((words, _, rules, _, _)) => {
-                            ui.label(
-                                egui::RichText::new(format!("слов: {words} · правил: {rules}"))
-                                    .small()
-                                    .color(COLOR_DIM),
-                            );
-                        }
-                        None => {
-                            ui.label(
-                                egui::RichText::new("словарь загружается…")
-                                    .small()
-                                    .color(COLOR_DIM),
-                            );
-                        }
-                    },
-                );
-            });
-        });
-    }
-
-    /// Верхняя лента: все флажки ёфикации + главная кнопка «Ёфицировать».
-    fn options_strip(&mut self, ctx: &egui::Context) {
-        egui::TopBottomPanel::top("options_strip").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal_wrapped(|ui| {
-                // ── главная кнопка ──────────────────────────────────────
-                let btn =
-                    egui::Button::new(egui::RichText::new("Ёфицировать").strong().color(COLOR_YO));
-                if ui.add_enabled(!self.busy(), btn).clicked() {
-                    self.start();
-                }
-                if ui
-                    .add_enabled(self.busy(), egui::Button::new("Стоп"))
-                    .clicked()
-                {
-                    self.stop();
-                }
-                ui.separator();
-
-                // ── флажки вкладки «Ёфикация» ───────────────────────────
-                let o = &mut self.opts;
-                ui.checkbox(&mut o.reg_exprs, "Рег. выражения")
-                    .on_hover_text("Использование словаря регулярных выражений");
-                ui.checkbox(&mut o.no_var_only, "Только безопасные")
-                    .on_hover_text("Только беспоспорные замены");
-                ui.checkbox(&mut o.var_only, "Только интерактивные")
-                    .on_hover_text("Только интерактивные замены");
-                ui.checkbox(&mut o.check_yo, "Проверять «ё»")
-                    .on_hover_text("Проверять расстановку «ё»");
-                ui.checkbox(&mut o.always_ask, "Всегда подтверждать")
-                    .on_hover_text("Всегда подтверждать замену");
-                ui.separator();
-                ui.checkbox(&mut o.to_confirm_abbr, "…для сокращений")
-                    .on_hover_text("Всегда подтверждать замену для сокращений");
-                ui.checkbox(&mut o.to_confirm_cap, "…для имён")
-                    .on_hover_text("Всегда подтверждать замену для имён собственных");
-                ui.checkbox(&mut o.to_confirm_ellipsis, "…для оборванных")
-                    .on_hover_text("Всегда подтверждать замену для оборванных слов");
-                ui.separator();
-                ui.checkbox(&mut o.propose_last, "Последний вариант")
-                    .on_hover_text("Предлагать последний вариант замены");
-                ui.checkbox(&mut o.fb_format, "FictionBook")
-                    .on_hover_text("Учитывать формат FictionBook (не трогать <binary>)");
-                ui.checkbox(&mut o.mark, "Помечать")
-                    .on_hover_text("Помечать исправленное");
-                ui.checkbox(&mut o.word_wrap, "Перенос строк")
-                    .on_hover_text("Переносить текст по словам");
-                ui.separator();
-
-                // ── политика для неоднозначных слов ─────────────────────
-                ui.label("Неоднозначные:");
-                if ui
-                    .button(self.opts.ambiguous.label())
-                    .on_hover_text("Слова, помеченные «?»: клик переключает")
-                    .clicked()
-                {
-                    self.opts.ambiguous = next_policy(self.opts.ambiguous);
-                }
-            });
-            ui.add_space(4.0);
-        });
-    }
-
-    /// Единственный редактор: текст и результат — один и тот же буфер.
-    fn editor_panel(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("Текст").strong());
-                ui.label(
-                    egui::RichText::new(format!("{} симв.", self.text_chars))
-                        .small()
-                        .color(COLOR_DIM),
-                );
-                if self.busy() {
-                    ui.spinner();
-                    ui.label(
-                        egui::RichText::new("ёфикация…")
-                            .small()
-                            .color(COLOR_DIM),
-                    );
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.checkbox(&mut self.highlight, "подсветка замен")
-                        .on_hover_text("Красить буквы, которые изменила ёфикация");
-                });
-            });
-            ui.separator();
-
-            if self.text_chars > MAX_EDITOR_CHARS {
-                ui.vertical_centered(|ui| {
-                    ui.add_space(24.0);
-                    ui.label(
-                        egui::RichText::new(
-                            "Текст слишком большой для экранного редактора.\n\
-                             Обработайте его в файловом режиме:\n\n    yol -i большой.txt -o результат.txt",
-                        )
-                        .color(COLOR_MARK),
-                    );
-                });
-                return;
-            }
-
-            // Пока идёт прогон, движок переписывает этот же буфер, поэтому
-            // ввод блокируем — как `Editor.ReadOnly := True` оригинала.
-            let busy = self.busy();
-            self.sync_editor_selection(ctx);
-            let ask_word = self.ask_selection;
-            let scroll_now = self.scroll_to_ask && ask_word.is_some();
-
-            let highlighted = self.highlight
-                && self.opts.mark
-                && !self.marks.is_empty()
-                && self.text.len() <= MAX_HIGHLIGHT_CHARS;
-
-            let marks: &[(usize, usize)] = &self.marks;
-            let mut layouter = |ui: &egui::Ui, s: &str, wrap_width: f32| {
-                let mut job = highlight_job(ui, s, marks);
-                job.wrap.max_width = wrap_width;
-                ui.fonts(|f| f.layout_job(job))
-            };
-
-            let row_height = ui.text_style_height(&egui::TextStyle::Monospace).max(1.0);
-            let rows = ((ui.available_height() / row_height).floor() as usize).max(1);
-            let width = if self.opts.word_wrap {
-                ui.available_width()
-            } else {
-                f32::INFINITY
-            };
-
-            let mut changed = false;
-            egui::ScrollArea::both()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    let mut edit = egui::TextEdit::multiline(&mut self.text)
-                        .id(text_edit_id())
-                        .font(egui::TextStyle::Monospace)
-                        .desired_width(width)
-                        .desired_rows(rows)
-                        .frame(false)
-                        .interactive(!busy)
-                        .hint_text(
-                            "Вставьте текст или загрузите файл (Файл → Загрузить текст…)",
-                        );
-                    if highlighted {
-                        edit = edit.layouter(&mut layouter);
-                    }
-                    let out = edit.show(ui);
-                    changed = out.response.changed();
-                    if let Some(range) = ask_word {
-                        // `TextEdit` рисует выделение только в фокусе, а
-                        // read-only редактор его не получает — подсвечиваем
-                        // слово сами, как `Editor.SelLength` оригинала.
-                        paint_ask_word(ui, &out, range);
-                        if scroll_now {
-                            // Оригинал прокручивал редактор к спорному слову.
-                            let cursor = out.galley.from_ccursor(CCursor::new(range.0));
-                            let rect = out
-                                .galley
-                                .pos_from_cursor(&cursor)
-                                .translate(out.galley_pos.to_vec2());
-                            ui.scroll_to_rect(rect, Some(egui::Align::Center));
-                        }
-                    }
-                });
-            if scroll_now {
-                self.scroll_to_ask = false;
-            }
-
-            if changed {
-                // Ручная правка делает пометки неверными.
-                self.marks.clear();
-                self.text_chars = self.text.chars().count();
-            }
-        });
-    }
-
-    /// Отметить спорное слово в состоянии редактора — аналог
-    /// `Editor.SelStart := Idx; Editor.SelLength := Length(Word1)`.
-    ///
-    /// Состояние `TextEditState` — единственный «официальный» способ задать
-    /// выделение снаружи; видимую плашку рисует [`paint_ask_word`], потому что
-    /// редактор во время прогона только для чтения и фокуса не получает.
-    fn sync_editor_selection(&mut self, ctx: &egui::Context) {
-        let id = text_edit_id();
-        if let Some((start, end)) = self.ask_selection {
-            let mut state = TextEditState::load(ctx, id).unwrap_or_default();
-            state.cursor.set_char_range(Some(CCursorRange::two(
-                CCursor::new(start),
-                CCursor::new(end),
-            )));
-            state.store(ctx, id);
+            self.status_left = "дождитесь окончания ёфикации".to_owned();
             return;
         }
-        if let Some(pos) = self.selection_after.take() {
-            // Ответ получен — снимаем выделение (`SelLength := 0`).
-            let mut state = TextEditState::load(ctx, id).unwrap_or_default();
-            state
-                .cursor
-                .set_char_range(Some(CCursorRange::one(CCursor::new(pos))));
-            state.store(ctx, id);
+        if !ask {
+            if let Some(path) = self.current_file.clone() {
+                self.save_path(path, self.current_encoding);
+                return;
+            }
+        }
+        let suggested = self
+            .current_file
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or("текст.txt")
+            .to_owned();
+        self.dialog.open_for_save(&suggested);
+        if let Some(dir) = self.current_file.as_deref().and_then(|p| p.parent()) {
+            self.dialog.dir = dir.to_path_buf();
+            self.dialog.refresh();
+        }
+        self.dialog.encoding = self.current_encoding;
+    }
+
+    /// «Очистить текстовое окно».
+    fn clear_text(&mut self) {
+        if self.busy() {
+            self.status_left = "дождитесь окончания ёфикации".to_owned();
+            return;
+        }
+        self.text.clear();
+        self.text_chars = 0;
+        self.run_source = None;
+        self.marks.clear();
+        self.journal.clear();
+        self.stats = Stats::default();
+        self.ask = None;
+        self.ask_selection = None;
+        self.selection_after = None;
+        self.current_file = None;
+        self.status_left = "окно очищено".to_owned();
+    }
+
+    /// Запомнить файл в списке последних (без дублей).
+    fn remember_file(&mut self, path: &Path) {
+        self.recent.retain(|p| p != path);
+        self.recent.insert(0, path.to_path_buf());
+        self.recent.truncate(MAX_RECENT);
+    }
+
+    /// «Файл → Свойства файла» (`Ctrl+P`).
+    fn open_props(&mut self) {
+        self.props = Some(FileProps::collect(
+            self.current_file.as_deref(),
+            &self.text,
+            self.current_encoding,
+        ));
+        self.show_props = true;
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Ёфикация
+    // ────────────────────────────────────────────────────────────────────
+
+    /// `F9`: ёфицировать с начала слова под курсором.
+    fn yoficate_from_cursor(&mut self, ctx: &egui::Context) {
+        if self.busy() {
+            return;
+        }
+        let pos = self.cursor_char_index(ctx);
+        let byte = char_to_byte(&self.text, pos);
+        self.start_at(byte);
+    }
+
+    /// Позиция курсора в символах (0, если редактор ещё не трогали).
+    fn cursor_char_index(&self, ctx: &egui::Context) -> usize {
+        TextEditState::load(ctx, text_edit_id())
+            .and_then(|s| s.cursor.char_range())
+            .map(|r| r.primary.index.min(self.text_chars))
+            .unwrap_or(0)
+    }
+
+    /// Убрать подсветку замен (`Shift+F10`).
+    fn remove_marks(&mut self) {
+        self.marks.clear();
+        self.status_left = "подсветка замен убрана".to_owned();
+    }
+
+    /// «Сбросить „Всегда Е/Ё“» — забыть ответы, запомненные пользователем.
+    fn reset_user_selections(&mut self) {
+        if self.busy() {
+            self.status_left = "дождитесь окончания ёфикации".to_owned();
+            return;
+        }
+        if let Some(dict) = self.dict_override {
+            dict.clear_user_sel();
+        } else {
+            yol::yo_core::dictionary().clear_user_sel();
+        }
+        self.status_left = "запомненные ответы сброшены".to_owned();
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Поиск
+    // ────────────────────────────────────────────────────────────────────
+
+    fn open_find(&mut self, regex: bool) {
+        self.show_find = true;
+        self.find.regex = regex;
+        self.find.error = None;
+    }
+
+    /// Текущая позиция курсора — с неё начинается следующий поиск.
+    fn search_start(&self, ctx: &egui::Context) -> usize {
+        match TextEditState::load(ctx, text_edit_id()).and_then(|s| s.cursor.char_range()) {
+            Some(r) => r.primary.index.max(r.secondary.index),
+            None => 0,
         }
     }
 
-    /// Есть ли в редакторе непустое выделение (для пунктов «Вырезать»/«Копировать»).
-    fn has_selection(&self, ctx: &egui::Context) -> bool {
-        ctx.memory(|mem| mem.has_focus(text_edit_id()))
-            && TextEditState::load(ctx, text_edit_id())
-                .and_then(|s| s.cursor.char_range())
-                .is_some_and(|r| r.primary.index != r.secondary.index)
+    /// Найти следующее совпадение и выделить его (с переносом через край).
+    fn find_again(&mut self, ctx: &egui::Context, forward: bool) {
+        if self.find.query.is_empty() {
+            self.open_find(false);
+            return;
+        }
+        let from = self.search_start(ctx);
+        let found = if self.find.regex {
+            match regex_find(
+                &self.text,
+                &self.find.query,
+                from,
+                forward,
+                self.find.case_sensitive,
+            ) {
+                Ok(v) => {
+                    self.find.error = None;
+                    v
+                }
+                Err(e) => {
+                    self.find.error = Some(e);
+                    None
+                }
+            }
+        } else {
+            text_find(
+                &self.text,
+                &self.find.query,
+                from,
+                forward,
+                self.find.case_sensitive,
+            )
+        };
+        match found {
+            Some((s, e)) => {
+                self.find.last = Some((s, e));
+                self.select_chars(ctx, s, e);
+                self.scroll_to_selection = Some(s);
+                let snippet: String = self
+                    .text
+                    .chars()
+                    .skip(s)
+                    .take(e.saturating_sub(s).min(40))
+                    .collect();
+                self.status_left = format!("найдено: {snippet}");
+            }
+            None => {
+                self.status_left = format!("не найдено: {}", self.find.query);
+                self.find.last = None;
+            }
+        }
     }
 
-    /// Выделить весь текст (Ctrl+A / «Правка → Выделить всё»).
-    fn select_all(&mut self, ctx: &egui::Context) {
-        let n = self.text.chars().count();
-        self.text_chars = n;
+    /// Выделить диапазон в **символах** и дать редактору фокус.
+    fn select_chars(&mut self, ctx: &egui::Context, start: usize, end: usize) {
         let id = text_edit_id();
         let mut state = TextEditState::load(ctx, id).unwrap_or_default();
-        state
-            .cursor
-            .set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(n))));
+        state.cursor.set_char_range(Some(CCursorRange::two(
+            CCursor::new(start),
+            CCursor::new(end),
+        )));
         state.store(ctx, id);
-        ctx.memory_mut(|mem| mem.request_focus(id));
+        ctx.memory_mut(|m| m.request_focus(id));
+    }
+
+    /// «Искать замену вперёд/назад» (`Ctrl+W` / `Ctrl+Q`).
+    ///
+    /// Ищет в тексте ближайшее слово, для которого словарь знает замену,
+    /// отличную от написанного, и выделяет его — так же, как это делал
+    /// `FindNextYofication` оригинала. Поиск зациклен.
+    fn find_yofication_word(&mut self, ctx: &egui::Context, forward: bool) {
+        if self.text.is_empty() {
+            self.status_left = "нечего искать — текст пуст".to_owned();
+            return;
+        }
+        let dict = self.dict_override.unwrap_or_else(yol::yo_core::dictionary);
+        let chars: Vec<char> = self.text.chars().collect();
+        let n = chars.len();
+        let from = self.search_start(ctx).min(n);
+
+        // Обходим слова в нужную сторону с переносом через край.
+        let order: Vec<usize> = if forward {
+            (from..n).chain(0..from).collect()
+        } else {
+            (0..from).rev().chain((from..n).rev()).collect()
+        };
+        let mut i = 0usize;
+        while i < order.len() {
+            let at = order[i];
+            if !yol::yo_core::is_alpha(chars[at]) {
+                i += 1;
+                continue;
+            }
+            let mut s = at;
+            while s > 0 && yol::yo_core::is_alpha(chars[s - 1]) {
+                s -= 1;
+            }
+            let mut e = at;
+            while e < n && yol::yo_core::is_alpha(chars[e]) {
+                e += 1;
+            }
+            let word: String = chars[s..e].iter().collect();
+            if let Some((ye, yo)) = dictionary_variants(dict, &word) {
+                let current = &word;
+                let differs = current != &ye && current != &yo;
+                if differs && (ye != yo || !current.eq_ignore_ascii_case(&ye)) {
+                    self.select_chars(ctx, s, e);
+                    self.scroll_to_selection = Some(s);
+                    self.status_left = format!("замена: {ye} → {yo}");
+                    return;
+                }
+            }
+            // Перепрыгиваем слово целиком, чтобы не проверять его по буквам.
+            i += (e - at).max(1);
+        }
+        self.status_left = format!(
+            "дальше {} замен не найдено",
+            if forward { "" } else { "назад " }
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Горячие клавиши
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Обработать глобальные сочетания клавиш.
+    ///
+    /// Список повторяет меню Delphi-оригинала; `Ctrl+X/C/V/A/Z` не трогаем —
+    /// их обслуживает сам `TextEdit` нативными событиями egui.
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        use egui::{Key, Modifiers};
+
+        let ctrl = Modifiers::CTRL;
+        let ctrl_alt = Modifiers::CTRL.plus(Modifiers::ALT);
+        let shift = Modifiers::SHIFT;
+
+        if shortcut(ctx, ctrl, Key::L) {
+            self.open_load_dialog();
+        }
+        if shortcut(ctx, ctrl, Key::S) {
+            self.save_text(true);
+        }
+        if shortcut(ctx, ctrl_alt, Key::S) {
+            self.save_text(false);
+        }
+        if shortcut(ctx, ctrl, Key::P) {
+            self.open_props();
+        }
+        // Как в Delphi-оригинале: Ctrl+O и Ctrl+Alt+O открывают «Опции».
+        if shortcut(ctx, ctrl_alt, Key::O) || shortcut(ctx, ctrl, Key::O) {
+            self.show_options = true;
+        }
+        if shortcut(ctx, ctrl, Key::F) {
+            self.open_find(false);
+        }
+        if shortcut(ctx, ctrl, Key::R) {
+            self.open_find(true);
+        }
+        if shortcut(ctx, Modifiers::NONE, Key::F3) {
+            self.find_again(ctx, true);
+        }
+        if shortcut(ctx, ctrl, Key::W) {
+            self.find_yofication_word(ctx, true);
+        }
+        if shortcut(ctx, ctrl, Key::Q) {
+            self.find_yofication_word(ctx, false);
+        }
+        if shortcut(ctx, ctrl, Key::F9) {
+            self.start();
+        } else if shortcut(ctx, Modifiers::NONE, Key::F9) {
+            self.yoficate_from_cursor(ctx);
+        }
+        if shortcut(ctx, shift, Key::F10) {
+            self.remove_marks();
+        }
+        if shortcut(ctx, Modifiers::NONE, Key::F1) {
+            self.show_about = true;
+        }
+        // Esc: сначала закрывает запрос (это делает панель), затем прерывает
+        // прогон — как «Прервать (Esc)» оригинала.
+        if self.ask.is_none() && self.busy() && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.stop();
+        }
     }
 
     /// Панель запроса — наследница `AskPanel` из Main.dfm.
@@ -1234,13 +1480,15 @@ impl YoApp {
         };
 
         let mut decision: Option<AskDecision> = None;
+        let ask_text = color32(self.ask_text);
+        let plate = color32a(self.ask_plate);
         egui::TopBottomPanel::bottom("ask_panel")
             .resizable(false)
             // Высота запоминается с предыдущего кадра; запас на первый кадр,
             // чтобы кнопки не оказались за нижним краем окна.
             .default_height(88.0)
             .show(ctx, |ui| {
-                let (clicked, _) = ask_panel_ui(ui, &ask);
+                let (clicked, _) = ask_panel_ui(ui, &ask, ask_text, plate);
                 decision = clicked;
             });
 
@@ -1303,6 +1551,883 @@ impl YoApp {
             });
         });
     }
+
+    // ── главное меню ───────────────────────────────────────────────────
+    fn menu_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::top("menu_bar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                self.file_menu(ui, ctx);
+                self.edit_menu(ui, ctx);
+                self.yofication_menu(ui, ctx);
+                self.settings_menu(ui);
+                self.help_menu(ui);
+
+                ui.with_layout(
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| match &self.dict_info {
+                        Some((words, _, rules, _, _)) => {
+                            ui.label(
+                                egui::RichText::new(format!("слов: {words} · правил: {rules}"))
+                                    .small()
+                                    .color(COLOR_DIM),
+                            );
+                        }
+                        None => {
+                            ui.label(
+                                egui::RichText::new("словарь загружается…")
+                                    .small()
+                                    .color(COLOR_DIM),
+                            );
+                        }
+                    },
+                );
+            });
+        });
+    }
+
+    /// Пункт меню с подписью и «горячей клавишей» справа.
+    fn menu_item(ui: &mut egui::Ui, label: &str, shortcut: &str, enabled: bool) -> bool {
+        let button = if shortcut.is_empty() {
+            egui::Button::new(label)
+        } else {
+            egui::Button::new(label).shortcut_text(shortcut)
+        };
+        ui.add_enabled(enabled, button).clicked()
+    }
+
+    // ── «Файл» ─────────────────────────────────────────────────────────
+    fn file_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.menu_button("Файл", |ui| {
+            let idle = !self.busy();
+            let has_text = !self.text.is_empty();
+
+            if Self::menu_item(ui, "Загрузить текст…", "Ctrl+L", idle) {
+                self.open_load_dialog();
+                ui.close_menu();
+            }
+            if Self::menu_item(ui, "Сохранить текст", "Ctrl+Alt+S", idle && has_text)
+            {
+                self.save_text(false);
+                ui.close_menu();
+            }
+            if Self::menu_item(ui, "Сохранить текст как…", "Ctrl+S", idle && has_text)
+            {
+                self.save_text(true);
+                ui.close_menu();
+            }
+            if Self::menu_item(ui, "Очистить текстовое окно", "", idle && has_text)
+            {
+                self.clear_text();
+                ui.close_menu();
+            }
+            ui.separator();
+            if Self::menu_item(ui, "Загрузить основной словарь…", "", idle)
+            {
+                self.dialog
+                    .open_for(FilePurpose::Dictionary, self.dictionary_path.as_deref());
+                ui.close_menu();
+            }
+            if Self::menu_item(ui, "Загрузить словарь регулярных выражений…", "", idle)
+            {
+                self.dialog.open_for(
+                    FilePurpose::RegexDictionary,
+                    self.regex_dict_path.as_deref(),
+                );
+                ui.close_menu();
+            }
+            if Self::menu_item(
+                ui,
+                "Очистить список последних файлов",
+                "",
+                !self.recent.is_empty(),
+            ) {
+                self.recent.clear();
+                ui.close_menu();
+            }
+            if Self::menu_item(ui, "Свойства файла…", "Ctrl+P", true) {
+                self.open_props();
+                ui.close_menu();
+            }
+            ui.separator();
+            if Self::menu_item(ui, "Выход", "", true) {
+                self.save_settings();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                ui.close_menu();
+            }
+
+            // ── список последних файлов, как `Openfile0…` оригинала ────
+            if !self.recent.is_empty() {
+                ui.separator();
+                let recent = self.recent.clone();
+                for (i, path) in recent.iter().enumerate() {
+                    let label = format!(
+                        "{}. {}",
+                        i + 1,
+                        path.file_name().unwrap_or_default().to_string_lossy()
+                    );
+                    let resp = ui
+                        .add_enabled(idle, egui::Button::new(label))
+                        .on_hover_text(path.display().to_string());
+                    if resp.clicked() {
+                        if path.is_file() {
+                            self.load_path(path.clone(), None);
+                        } else {
+                            self.status_left = format!("файл не найден: {}", path.display());
+                            self.recent.retain(|p| p != path);
+                        }
+                        ui.close_menu();
+                    }
+                }
+            } else if let Some(path) = &self.current_file {
+                ui.separator();
+                ui.label(
+                    egui::RichText::new(path.to_string_lossy().into_owned())
+                        .small()
+                        .color(COLOR_DIM),
+                );
+            }
+        });
+    }
+
+    // ── «Редактировать» ────────────────────────────────────────────────
+    fn edit_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.menu_button("Редактировать", |ui| {
+            // Ctrl+X / Ctrl+C / Ctrl+V обслуживает сам `TextEdit` (нативные
+            // события egui). Пунктам меню достаточно попросить об этом
+            // eframe: `RequestPaste` заставляет интеграцию прочитать системный
+            // буфер обмена и прислать `Event::Paste` — отдельный `arboard`
+            // не нужен.
+            let idle = !self.busy();
+            let can_cut = idle && self.has_selection(ctx);
+            if Self::menu_item(ui, "Вырезать", "Ctrl+X", can_cut) {
+                ctx.memory_mut(|m| m.request_focus(text_edit_id()));
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestCut);
+                ui.close_menu();
+            }
+            if Self::menu_item(ui, "Копировать", "Ctrl+C", can_cut) {
+                if let Some(text) = self.selected_text(ctx) {
+                    ctx.copy_text(text);
+                }
+                ctx.memory_mut(|m| m.request_focus(text_edit_id()));
+                ui.close_menu();
+            }
+            if Self::menu_item(ui, "Вставить", "Ctrl+V", idle) {
+                ctx.memory_mut(|m| m.request_focus(text_edit_id()));
+                ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                ui.close_menu();
+            }
+            if Self::menu_item(ui, "Выделить всё", "Ctrl+A", idle) {
+                self.select_all(ctx);
+                ui.close_menu();
+            }
+            ui.separator();
+            if Self::menu_item(ui, "Откат", "Ctrl+Z", idle && !self.text.is_empty()) {
+                request_undo(ctx);
+                ui.close_menu();
+            }
+            ui.separator();
+            if Self::menu_item(ui, "Найти…", "Ctrl+F", idle) {
+                self.open_find(false);
+                ui.close_menu();
+            }
+            if Self::menu_item(ui, "Найти регулярное выражение…", "Ctrl+R", idle)
+            {
+                self.open_find(true);
+                ui.close_menu();
+            }
+            if Self::menu_item(ui, "Найти снова", "F3", idle && !self.find.query.is_empty())
+            {
+                self.find_again(ctx, true);
+                ui.close_menu();
+            }
+            if Self::menu_item(ui, "Искать замену вперёд", "Ctrl+W", idle) {
+                self.find_yofication_word(ctx, true);
+                ui.close_menu();
+            }
+            if Self::menu_item(ui, "Искать замену назад", "Ctrl+Q", idle) {
+                self.find_yofication_word(ctx, false);
+                ui.close_menu();
+            }
+        });
+    }
+
+    // ── «Ёфикация» ─────────────────────────────────────────────────────
+    fn yofication_menu(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        ui.menu_button("Ёфикация", |ui| {
+            let idle = !self.busy();
+            let has_text = !self.text.is_empty();
+            if Self::menu_item(ui, "Ёфицировать с текущей позиции", "F9", idle && has_text)
+            {
+                self.yoficate_from_cursor(ctx);
+                ui.close_menu();
+            }
+            if Self::menu_item(
+                ui,
+                "Ёфицировать с начала текста",
+                "Ctrl+F9",
+                idle && has_text,
+            ) {
+                self.start();
+                ui.close_menu();
+            }
+            ui.separator();
+            if Self::menu_item(ui, "Убрать выделение", "Shift+F10", !self.marks.is_empty())
+            {
+                self.remove_marks();
+                ui.close_menu();
+            }
+            if Self::menu_item(ui, "Сбросить «Всегда Е/Ё»", "", true) {
+                self.reset_user_selections();
+                ui.close_menu();
+            }
+            ui.separator();
+            if Self::menu_item(ui, "Прервать", "Esc", self.busy()) {
+                self.stop();
+                ui.close_menu();
+            }
+            ui.separator();
+            if Self::menu_item(ui, "Статистика…", "", true) {
+                self.show_stats = true;
+                ui.close_menu();
+            }
+        });
+    }
+
+    // ── «Настройки» ────────────────────────────────────────────────────
+    fn settings_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Настройки", |ui| {
+            ui.menu_button("Ёфикация", |ui| {
+                self.yofication_options(ui);
+            });
+            ui.menu_button("Неоднозначные замены", |ui| {
+                for policy in AmbiguousPolicy::ALL {
+                    if ui
+                        .radio(self.opts.ambiguous == policy, policy.label())
+                        .clicked()
+                    {
+                        self.opts.ambiguous = policy;
+                        ui.close_menu();
+                    }
+                }
+            });
+            ui.menu_button("Редактор", |ui| {
+                self.editor_options(ui);
+            });
+            ui.separator();
+            if Self::menu_item(ui, "Шрифт…", "", true) {
+                self.open_font_dialog();
+                ui.close_menu();
+            }
+            if Self::menu_item(ui, "Цвета подсветки…", "", true) {
+                self.show_colors = true;
+                ui.close_menu();
+            }
+            if Self::menu_item(ui, "Опции…", "Ctrl+Alt+O", true) {
+                self.show_options = true;
+                ui.close_menu();
+            }
+        });
+    }
+
+    // ── «Помощь» ───────────────────────────────────────────────────────
+    fn help_menu(&mut self, ui: &mut egui::Ui) {
+        ui.menu_button("Помощь", |ui| {
+            if Self::menu_item(ui, "Статистика…", "", true) {
+                self.show_stats = true;
+                ui.close_menu();
+            }
+            if Self::menu_item(ui, "Журнал замен", "", !self.journal.is_empty()) {
+                self.show_journal = true;
+                ui.close_menu();
+            }
+            if Self::menu_item(ui, "О программе", "F1", true) {
+                self.show_about = true;
+                ui.close_menu();
+            }
+        });
+    }
+
+    /// Флажки вкладки «Ёфикация» — один и тот же код для меню и окна опций.
+    fn yofication_options(&mut self, ui: &mut egui::Ui) {
+        let o = &mut self.opts;
+        ui.checkbox(&mut o.reg_exprs, "Использовать регулярные выражения");
+        ui.separator();
+
+        // «Только безопасные» и «Только интерактивные» взаимоисключающие:
+        // включённый режим блокирует второй флажок.
+        let safe = ui.add_enabled(
+            !o.var_only,
+            egui::Checkbox::new(&mut o.no_var_only, "Только безопасные замены"),
+        );
+        if safe.changed() {
+            o.set_no_var_only(o.no_var_only);
+        }
+        let interactive = ui.add_enabled(
+            !o.no_var_only,
+            egui::Checkbox::new(&mut o.var_only, "Только интерактивные замены"),
+        );
+        if interactive.changed() {
+            o.set_var_only(o.var_only);
+        }
+
+        ui.separator();
+        ui.checkbox(&mut o.check_yo, "Проверять расстановку «ё»");
+        ui.checkbox(&mut o.always_ask, "Всегда подтверждать замену");
+        ui.checkbox(&mut o.to_confirm_abbr, "…подтверждать для сокращений");
+        ui.checkbox(&mut o.to_confirm_cap, "…подтверждать для имён собственных");
+        ui.checkbox(
+            &mut o.to_confirm_ellipsis,
+            "…подтверждать для оборванных слов",
+        );
+        ui.separator();
+        ui.checkbox(&mut o.propose_last, "Предлагать последний вариант замены");
+        ui.checkbox(&mut o.fb_format, "Учитывать формат FictionBook");
+        ui.checkbox(&mut o.fast_scroll, "Быстрая прокрутка");
+        ui.horizontal(|ui| {
+            ui.label("Строк проматки:");
+            let mut n = o.lines_below as i32;
+            if ui.add(egui::DragValue::new(&mut n).range(0..=20)).changed() {
+                o.lines_below = n.max(0) as usize;
+            }
+        });
+    }
+
+    /// Флажки вкладки «Редактор».
+    fn editor_options(&mut self, ui: &mut egui::Ui) {
+        let o = &mut self.opts;
+        ui.checkbox(&mut o.mark, "Помечать исправленное");
+        ui.checkbox(&mut o.word_wrap, "Переносить текст по словам");
+        ui.checkbox(&mut o.auto_unicode, "Автораспознавание Unicode");
+        ui.checkbox(&mut o.last_file, "Помнить последний файл");
+        ui.separator();
+        ui.checkbox(&mut self.highlight, "Подсвечивать замены в тексте");
+        ui.checkbox(&mut self.show_journal, "Вести журнал замен");
+        ui.checkbox(&mut self.dark, "Тёмная тема");
+    }
+
+    // ── редактор ───────────────────────────────────────────────────────
+    /// Единственный редактор: текст и результат — один и тот же буфер.
+    fn editor_panel(&mut self, ctx: &egui::Context) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.add_space(2.0);
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Текст").strong());
+                ui.label(
+                    egui::RichText::new(format!("{} симв.", self.text_chars))
+                        .small()
+                        .color(COLOR_DIM),
+                );
+                if self.busy() {
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new("ёфикация…")
+                            .small()
+                            .color(COLOR_DIM),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui
+                        .button("Найти")
+                        .on_hover_text("Найти текст или регулярное выражение (Ctrl+F)")
+                        .clicked()
+                    {
+                        self.open_find(false);
+                    }
+                    if self.highlight && !self.marks.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("замен: {}", self.marks.len()))
+                                .small()
+                                .color(COLOR_DIM),
+                        );
+                    }
+                });
+            });
+            ui.separator();
+
+            if self.text_chars > MAX_EDITOR_CHARS {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(24.0);
+                    ui.label(
+                        egui::RichText::new(
+                            "Текст слишком большой для экранного редактора.\n\
+                             Обработайте его в файловом режиме:\n\n    yol -i большой.txt -o результат.txt",
+                        )
+                        .color(COLOR_MARK),
+                    );
+                });
+                return;
+            }
+
+            // Пока идёт прогон, движок переписывает этот же буфер, поэтому
+            // ввод блокируем — как `Editor.ReadOnly := True` оригинала.
+            let busy = self.busy();
+            self.sync_editor_selection(ctx);
+            let ask_word = self.ask_selection;
+            let scroll_now = self.scroll_to_ask && ask_word.is_some();
+            let scroll_to = self.scroll_to_selection.take();
+
+            let highlighted = self.highlight
+                && self.opts.mark
+                && !self.marks.is_empty()
+                && self.text.len() <= MAX_HIGHLIGHT_CHARS;
+
+            let marks: &[(usize, usize)] = &self.marks;
+            let font = self.editor_font.clone();
+            let mark_text = color32(self.mark_text);
+            let mark_bg = color32(self.mark_bg);
+            let mut layouter = |ui: &egui::Ui, s: &str, wrap_width: f32| {
+                let mut job = highlight_job(ui, s, marks, &font, mark_text, mark_bg, highlighted);
+                job.wrap.max_width = wrap_width;
+                ui.fonts(|f| f.layout_job(job))
+            };
+
+            let row_height = ui.fonts(|f| f.row_height(&font.font_id())).max(1.0);
+            let rows = ((ui.available_height() / row_height).floor() as usize).max(1);
+            let width = if self.opts.word_wrap {
+                ui.available_width()
+            } else {
+                f32::INFINITY
+            };
+
+            let mut changed = false;
+            let mut menu: Option<EditorMenu> = None;
+            // Всё, что нужно контекстному меню, считаем до `TextEdit`:
+            // его `&mut self.text` держится до конца блока.
+            let has_sel = self.has_selection(ctx);
+            let can_paste = !busy;
+            let can_clear = !busy && !self.text.is_empty();
+            let ask_plate = color32a(self.ask_plate);
+            let ask_underline = self.ask_underline;
+            egui::ScrollArea::both()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    let edit = egui::TextEdit::multiline(&mut self.text)
+                        .id(text_edit_id())
+                        .font(font.font_id())
+                        .desired_width(width)
+                        .desired_rows(rows)
+                        .frame(false)
+                        .interactive(!busy)
+                        .hint_text(
+                            "Вставьте текст или загрузите файл (Файл → Загрузить текст…)",
+                        )
+                        // Свой расчёт вёрстки нужен всегда: только он умеет
+                        // подсветку замен и синтетический курсив.
+                        .layouter(&mut layouter);
+                    let out = edit.show(ui);
+
+                    // ── контекстное меню правой кнопки ─────────────────
+                    out.response.context_menu(|ui| {
+                        if ui
+                            .add_enabled(has_sel, egui::Button::new("Копировать"))
+                            .clicked()
+                        {
+                            menu = Some(EditorMenu::Copy);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(can_paste, egui::Button::new("Вставить"))
+                            .clicked()
+                        {
+                            menu = Some(EditorMenu::Paste);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(can_clear, egui::Button::new("Очистить всё"))
+                            .clicked()
+                        {
+                            menu = Some(EditorMenu::Clear);
+                            ui.close_menu();
+                        }
+                    });
+
+                    changed = out.response.changed();
+                    if let Some(range) = ask_word {
+                        // `TextEdit` рисует выделение только в фокусе, а
+                        // read-only редактор его не получает — подсвечиваем
+                        // слово сами, как `Editor.SelLength` оригинала.
+                        paint_ask_word(ui, &out, range, ask_plate, ask_underline);
+                        if scroll_now {
+                            let cursor = out.galley.from_ccursor(CCursor::new(range.0));
+                            let rect = out
+                                .galley
+                                .pos_from_cursor(&cursor)
+                                .translate(out.galley_pos.to_vec2());
+                            ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                        }
+                    }
+                    if let Some(pos) = scroll_to {
+                        let cursor = out.galley.from_ccursor(CCursor::new(pos));
+                        let rect = out
+                            .galley
+                            .pos_from_cursor(&cursor)
+                            .translate(out.galley_pos.to_vec2());
+                        ui.scroll_to_rect(rect, Some(egui::Align::Center));
+                    }
+                });
+            if scroll_now {
+                self.scroll_to_ask = false;
+            }
+            match menu {
+                Some(EditorMenu::Copy) => {
+                    if let Some(text) = self.selected_text(ctx) {
+                        ctx.copy_text(text);
+                        self.status_left = "скопировано".to_owned();
+                    }
+                }
+                Some(EditorMenu::Paste) => {
+                    ctx.memory_mut(|m| m.request_focus(text_edit_id()));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
+                }
+                Some(EditorMenu::Clear) => self.clear_text(),
+                None => {}
+            }
+
+            if changed {
+                // Ручная правка делает пометки неверными.
+                self.marks.clear();
+                self.text_chars = self.text.chars().count();
+            }
+        });
+    }
+
+    /// Текст выделения редактора (для «Копировать» из контекстного меню).
+    fn selected_text(&self, ctx: &egui::Context) -> Option<String> {
+        let r = TextEditState::load(ctx, text_edit_id())?
+            .cursor
+            .char_range()?;
+        let (a, b) = (
+            r.primary.index.min(r.secondary.index),
+            r.primary.index.max(r.secondary.index),
+        );
+        if a == b {
+            return None;
+        }
+        Some(self.text.chars().skip(a).take(b - a).collect())
+    }
+
+    /// Отметить спорное слово в состоянии редактора — аналог
+    /// `Editor.SelStart := Idx; Editor.SelLength := Length(Word1)`.
+    ///
+    /// Состояние `TextEditState` — единственный «официальный» способ задать
+    /// выделение снаружи; видимую плашку рисует [`paint_ask_word`], потому что
+    /// редактор во время прогона только для чтения и фокуса не получает.
+    fn sync_editor_selection(&mut self, ctx: &egui::Context) {
+        let id = text_edit_id();
+        if let Some((start, end)) = self.ask_selection {
+            let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+            state.cursor.set_char_range(Some(CCursorRange::two(
+                CCursor::new(start),
+                CCursor::new(end),
+            )));
+            state.store(ctx, id);
+            return;
+        }
+        if let Some(pos) = self.selection_after.take() {
+            // Ответ получен — снимаем выделение (`SelLength := 0`).
+            let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+            state
+                .cursor
+                .set_char_range(Some(CCursorRange::one(CCursor::new(pos))));
+            state.store(ctx, id);
+        }
+    }
+
+    /// Есть ли в редакторе непустое выделение (для пунктов «Вырезать»/«Копировать»).
+    fn has_selection(&self, ctx: &egui::Context) -> bool {
+        // Фокус не требуем: меню и контекстное меню забирают его у редактора,
+        // но выделение при этом остаётся.
+        TextEditState::load(ctx, text_edit_id())
+            .and_then(|s| s.cursor.char_range())
+            .is_some_and(|r| r.primary.index != r.secondary.index)
+    }
+
+    /// Выделить весь текст (Ctrl+A / «Правка → Выделить всё»).
+    fn select_all(&mut self, ctx: &egui::Context) {
+        let n = self.text.chars().count();
+        self.text_chars = n;
+        let id = text_edit_id();
+        let mut state = TextEditState::load(ctx, id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(CCursorRange::two(CCursor::new(0), CCursor::new(n))));
+        state.store(ctx, id);
+        ctx.memory_mut(|mem| mem.request_focus(id));
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Шрифты и стиль
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Тема + стиль. `set_visuals` заменяет `Visuals` **целиком**, поэтому стиль
+/// накладывается строго после него — иначе скругления виджетов сбрасываются.
+fn apply_theme(ctx: &egui::Context, dark: bool) {
+    ctx.set_visuals(if dark {
+        egui::Visuals::dark()
+    } else {
+        egui::Visuals::light()
+    });
+    setup_style(ctx);
+}
+
+/// Современная «тёмная» подача: скругления, воздух, читаемый кегль.
+fn setup_style(ctx: &egui::Context) {
+    ctx.style_mut(|style| {
+        let r = egui::CornerRadius::same(6);
+        style.visuals.widgets.noninteractive.corner_radius = r;
+        style.visuals.widgets.inactive.corner_radius = r;
+        style.visuals.widgets.hovered.corner_radius = r;
+        style.visuals.widgets.active.corner_radius = r;
+        style.visuals.widgets.open.corner_radius = r;
+        style.visuals.window_corner_radius = egui::CornerRadius::same(10);
+        style.visuals.menu_corner_radius = egui::CornerRadius::same(8);
+        style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+        style.spacing.button_padding = egui::vec2(10.0, 5.0);
+
+        // `fn_call_width` у rustfmt по умолчанию 60, поэтому аргументы
+        // записываем вертикально — так файл остаётся стабильным под `cargo fmt`.
+        let ts = &mut style.text_styles;
+        ts.insert(
+            egui::TextStyle::Small,
+            egui::FontId::new(12.0, egui::FontFamily::Proportional),
+        );
+        ts.insert(
+            egui::TextStyle::Body,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        );
+        ts.insert(
+            egui::TextStyle::Button,
+            egui::FontId::new(14.0, egui::FontFamily::Proportional),
+        );
+        ts.insert(
+            egui::TextStyle::Heading,
+            egui::FontId::new(19.0, egui::FontFamily::Proportional),
+        );
+        ts.insert(
+            egui::TextStyle::Monospace,
+            egui::FontId::new(14.5, egui::FontFamily::Monospace),
+        );
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Мелкие помощники интерфейса
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Время изменения файла в виде `ГГГГ-ММ-ДД ЧЧ:ММ`.
+fn format_system_time(t: SystemTime) -> String {
+    let secs = match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_secs() as i64,
+        Err(e) => -(e.duration().as_secs() as i64),
+    };
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (h, m) = (rem / 3600, (rem % 3600) / 60);
+    // Гражданский календарь из номера дня эпохи (алгоритм Ховарда Хиннанта).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096).div_euclid(365);
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = if month <= 2 { y + 1 } else { y };
+    format!("{year:04}-{month:02}-{d:02} {h:02}:{m:02}")
+}
+
+/// Пара «е/ё» для слова по словарю: `(вариант с Е, вариант с Ё)` в том же
+/// регистре, что и слово в тексте.
+fn dictionary_variants(dict: &Dictionary, word: &str) -> Option<(String, String)> {
+    let mut a = String::new();
+    let mut b = String::new();
+    dict.find_ul(word, &mut a, &mut b)
+        .map(|i| (copy_case(dict.ye(i), word), copy_case(dict.yo(i), word)))
+}
+
+/// Сработало ли сочетание клавиш (с погашением события).
+fn shortcut(ctx: &egui::Context, modifiers: egui::Modifiers, key: egui::Key) -> bool {
+    ctx.input_mut(|i| i.consume_shortcut(&egui::KeyboardShortcut::new(modifiers, key)))
+}
+
+/// Просьба к `TextEdit` откатить последнее изменение (`Ctrl+Z` из меню).
+///
+/// `TextEditState::undoer` закрыт, поэтому единственный публичный путь —
+/// подсунуть редактору то же событие, которое он получает от клавиатуры.
+fn request_undo(ctx: &egui::Context) {
+    ctx.memory_mut(|m| m.request_focus(text_edit_id()));
+    ctx.input_mut(|i| {
+        i.events.push(egui::Event::Key {
+            key: egui::Key::Z,
+            physical_key: Some(egui::Key::Z),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::COMMAND,
+        });
+    });
+}
+
+/// Байтовое смещение символа с индексом `index`.
+fn char_to_byte(text: &str, index: usize) -> usize {
+    text.char_indices()
+        .nth(index)
+        .map(|(b, _)| b)
+        .unwrap_or(text.len())
+}
+
+/// Индекс символа, в котором начинается байт `byte`.
+fn byte_to_char(text: &str, byte: usize) -> usize {
+    text.char_indices().take_while(|(b, _)| *b < byte).count()
+}
+
+/// Поиск подстроки, начиная с символа `from`; индексы — в символах.
+///
+/// Поиск зациклен: не найдя дальше, начинаем с начала (как «Найти снова»
+/// в Delphi-редакторе).
+fn text_find(
+    text: &str,
+    needle: &str,
+    from: usize,
+    forward: bool,
+    case_sensitive: bool,
+) -> Option<(usize, usize)> {
+    if needle.is_empty() {
+        return None;
+    }
+    let hay: Vec<char> = text.chars().collect();
+    let pat: Vec<char> = needle.chars().collect();
+    if pat.len() > hay.len() {
+        return None;
+    }
+    let eq = |a: char, b: char| {
+        if case_sensitive {
+            a == b
+        } else {
+            a.to_lowercase().eq(b.to_lowercase())
+        }
+    };
+    let matches = |at: usize| (0..pat.len()).all(|k| eq(hay[at + k], pat[k]));
+    let last = hay.len() - pat.len();
+
+    if forward {
+        let start = from.min(hay.len());
+        for at in (start..=last).chain(0..start.min(last + 1)) {
+            if matches(at) {
+                return Some((at, at + pat.len()));
+            }
+        }
+    } else {
+        let end = from.min(last + 1);
+        for at in (0..end).rev().chain((end..=last).rev()) {
+            if matches(at) {
+                return Some((at, at + pat.len()));
+            }
+        }
+    }
+    None
+}
+
+/// Поиск регулярного выражения; индексы — в символах.
+fn regex_find(
+    text: &str,
+    pattern: &str,
+    from: usize,
+    forward: bool,
+    case_sensitive: bool,
+) -> Result<Option<(usize, usize)>, String> {
+    let re = regex::RegexBuilder::new(pattern)
+        .case_insensitive(!case_sensitive)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let from_byte = char_to_byte(text, from);
+    let found = if forward {
+        re.find_at(text, from_byte).or_else(|| re.find(text))
+    } else {
+        let mut before = None;
+        for m in re.find_iter(text) {
+            if m.start() < from_byte {
+                before = Some(m);
+            } else {
+                break;
+            }
+        }
+        before.or_else(|| re.find_iter(text).last())
+    };
+    Ok(found.map(|m| (byte_to_char(text, m.start()), byte_to_char(text, m.end()))))
+}
+
+/// `Rgb` из настроек → цвет egui.
+fn color32(c: Rgb) -> egui::Color32 {
+    egui::Color32::from_rgb(c.r, c.g, c.b)
+}
+
+/// `Rgba` из настроек → цвет egui.
+fn color32a(c: Rgba) -> egui::Color32 {
+    egui::Color32::from_rgba_unmultiplied(c.r, c.g, c.b, c.a)
+}
+
+/// Цвет egui → компоненты для `yo.ini`.
+fn rgb_of(c: egui::Color32) -> Rgb {
+    let [r, g, b, _] = c.to_srgba_unmultiplied();
+    Rgb::new(r, g, b)
+}
+
+/// Цвет с прозрачностью → компоненты для `yo.ini`.
+fn rgba_of(c: egui::Color32) -> Rgba {
+    let [r, g, b, a] = c.to_srgba_unmultiplied();
+    Rgba::new(r, g, b, a)
+}
+
+impl Drop for YoApp {
+    /// Последний шанс сохранить `yo.ini`: eframe уничтожает приложение при
+    /// закрытии окна, и это единственный момент, общий для всех путей выхода.
+    fn drop(&mut self) {
+        self.save_settings();
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Реализация eframe::App
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl eframe::App for YoApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Тёмная тема — принудительно (по умолчанию). `set_visuals` каждый кадр
+        // клонировал бы Arc<Style>, поэтому применяем только при смене режима.
+        if self.applied_dark != Some(self.dark) {
+            apply_theme(ctx, self.dark);
+            self.applied_dark = Some(self.dark);
+        }
+
+        self.pump();
+        if self.busy() {
+            // Иначе egui не будет перерисовываться, пока не придёт ввод.
+            ctx.request_repaint();
+        }
+        self.handle_shortcuts(ctx);
+
+        self.menu_bar(ctx);
+        // Нижние панели накладываются в порядке вызова: первая — самая нижняя.
+        self.status_bar(ctx);
+        if self.ask.is_some() {
+            self.ask_panel(ctx);
+        }
+        self.editor_panel(ctx);
+
+        self.file_dialog_window(ctx);
+        self.find_window(ctx);
+        self.font_window(ctx);
+        self.colors_window(ctx);
+        self.props_window(ctx);
+        self.options_window(ctx);
+        self.about_window(ctx);
+        self.stats_window(ctx);
+        if self.show_journal {
+            self.journal_window(ctx);
+        }
+    }
 }
 
 /// Строка таблицы «ключ — значение» в окне статистики.
@@ -1312,34 +2437,36 @@ fn stats_row(ui: &mut egui::Ui, key: &str, value: String) {
     ui.end_row();
 }
 
-/// Следующий вариант политики для неоднозначных слов (кнопка-переключатель).
-fn next_policy(p: AmbiguousPolicy) -> AmbiguousPolicy {
-    match p {
-        AmbiguousPolicy::Yo => AmbiguousPolicy::Ye,
-        AmbiguousPolicy::Ye => AmbiguousPolicy::Ask,
-        AmbiguousPolicy::Ask => AmbiguousPolicy::Yo,
-    }
-}
-
-/// `LayoutJob` для единого редактора: обычный моноширинный текст плюс
+/// `LayoutJob` для единого редактора: текст выбранным шрифтом плюс
 /// подсветка изменённых букв.
 ///
 /// Текст обязан остаться ровно тем же, что и в буфере (никаких вставок),
-/// иначе `TextEdit` потеряет соответствие курсора и строк. Шрифт и цвет
-/// повторяют умолчания `TextEdit`, чтобы включение подсветки не «дёргало»
-/// вёрстку.
-fn highlight_job(ui: &egui::Ui, text: &str, marks: &[(usize, usize)]) -> egui::text::LayoutJob {
+/// иначе `TextEdit` потеряет соответствие курсора и строк.
+fn highlight_job(
+    ui: &egui::Ui,
+    text: &str,
+    marks: &[(usize, usize)],
+    font: &EditorFont,
+    mark_text: egui::Color32,
+    mark_bg: egui::Color32,
+    highlighted: bool,
+) -> egui::text::LayoutJob {
     let normal = egui::TextFormat {
-        font_id: egui::FontId::new(14.5, egui::FontFamily::Monospace),
+        font_id: font.font_id(),
         // Тот же цвет, что берёт сам `TextEdit` по умолчанию.
         color: ui.visuals().widgets.inactive.text_color(),
+        italics: font.italics,
         ..Default::default()
     };
-    let mut hot = normal.clone();
-    hot.color = COLOR_MARK;
-    hot.background = COLOR_MARK_BG;
-
     let mut job = egui::text::LayoutJob::default();
+    if !highlighted {
+        job.append(text, 0.0, normal);
+        return job;
+    }
+    let mut hot = normal.clone();
+    hot.color = mark_text;
+    hot.background = mark_bg;
+
     let mut pos = 0usize;
     for &(s, e) in marks {
         if s >= text.len() {
@@ -1371,9 +2498,11 @@ fn paint_ask_word(
     ui: &egui::Ui,
     out: &egui::widgets::text_edit::TextEditOutput,
     (start, end): (usize, usize),
+    plate: egui::Color32,
+    underline: f32,
 ) {
     let galley = &out.galley;
-    if start >= end {
+    if start >= end || end > galley.text().chars().count() {
         return;
     }
     let caret_start = galley
@@ -1393,39 +2522,100 @@ fn paint_ask_word(
             egui::pos2(caret_start.left(), caret_start.top()),
             egui::pos2(caret_end.left(), caret_start.bottom()),
         );
-        paint_word_rect(&painter, rect);
+        paint_word_rect(&painter, rect, plate, underline);
     } else {
         // Слово переносится: подсвечиваем хвост первой строки, все
         // промежуточные целиком и начало последней.
-        let mut rect = egui::Rect::from_min_max(
+        let rect = egui::Rect::from_min_max(
             egui::pos2(caret_start.left(), caret_start.top()),
             egui::pos2(galley.rect.right() + out.galley_pos.x, caret_start.bottom()),
         );
-        paint_word_rect(&painter, rect);
+        paint_word_rect(&painter, rect, plate, underline);
         for row in galley.rows.iter() {
             let row_rect = row.rect.translate(out.galley_pos.to_vec2());
             if row_rect.center().y <= first + 0.5 || row_rect.center().y >= last - 0.5 {
                 continue;
             }
-            rect = row_rect;
-            paint_word_rect(&painter, rect);
+            paint_word_rect(&painter, row_rect, plate, underline);
         }
         let rect = egui::Rect::from_min_max(
             egui::pos2(out.galley_pos.x, caret_end.top()),
             egui::pos2(caret_end.left(), caret_end.bottom()),
         );
-        paint_word_rect(&painter, rect);
+        paint_word_rect(&painter, rect, plate, underline);
     }
 }
 
 /// Плашка + подчёркивание: заметно, но текст остаётся читаемым.
-fn paint_word_rect(painter: &egui::Painter, rect: egui::Rect) {
-    painter.rect_filled(rect.expand2(egui::vec2(1.0, 1.0)), 2.0, COLOR_ASK_BG);
-    painter.hline(
-        rect.x_range(),
-        rect.bottom(),
-        egui::Stroke::new(1.5_f32, COLOR_MARK),
-    );
+fn paint_word_rect(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    plate: egui::Color32,
+    underline: f32,
+) {
+    painter.rect_filled(rect.expand2(egui::vec2(1.0, 1.0)), 2.0, plate);
+    if underline > 0.0 {
+        painter.hline(
+            rect.x_range(),
+            rect.bottom(),
+            egui::Stroke::new(underline, COLOR_MARK),
+        );
+    }
+}
+
+/// `LayoutJob` строки контекста для панели запроса.
+///
+/// Показывает `до` + спорное слово + `после`; спорное слово — цветом и
+/// плашкой из настроек, остальное — приглушённо. Слишком длинные «до»/«после»
+/// обрезаются, чтобы слово всегда оставалось видимым: берём последние
+/// [`CONTEXT_BEFORE`] и первые [`CONTEXT_AFTER`] символов.
+fn ask_context_job(
+    ask: &AskRequest,
+    ask_text: egui::Color32,
+    plate: egui::Color32,
+) -> egui::text::LayoutJob {
+    const CONTEXT_BEFORE: usize = 64;
+    const CONTEXT_AFTER: usize = 64;
+
+    let font = egui::FontId::monospace(13.0);
+    let dim = egui::TextFormat {
+        font_id: font.clone(),
+        color: COLOR_DIM,
+        ..Default::default()
+    };
+    let hot = egui::TextFormat {
+        font_id: font,
+        color: ask_text,
+        background: plate,
+        underline: egui::Stroke::new(1.0_f32, ask_text),
+        ..Default::default()
+    };
+
+    let mut job = egui::text::LayoutJob::default();
+    let before: String = ask
+        .before
+        .chars()
+        .rev()
+        .take(CONTEXT_BEFORE)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    if ask.before.chars().count() > CONTEXT_BEFORE {
+        job.append("…", 0.0, dim.clone());
+    }
+    if !before.is_empty() {
+        job.append(&before, 0.0, dim.clone());
+    }
+    job.append(&ask.word1, 0.0, hot);
+    let after: String = ask.after.chars().take(CONTEXT_AFTER).collect();
+    if !after.is_empty() {
+        job.append(&after, 0.0, dim.clone());
+    }
+    if ask.after.chars().count() > CONTEXT_AFTER {
+        job.append("…", 0.0, dim);
+    }
+    job
 }
 
 /// Тело панели запроса: рамка с заголовком и ряд из шести кнопок.
@@ -1433,7 +2623,12 @@ fn paint_word_rect(painter: &egui::Painter, rect: egui::Rect) {
 /// Вынесено из метода, чтобы вёрстку можно было проверить в тестах без окна
 /// (см. `mod gui_tests`). Возвращает нажатое решение и прямоугольник ряда —
 /// по нему тест убеждается, что кластер стоит ровно по центру.
-fn ask_panel_ui(ui: &mut egui::Ui, ask: &AskRequest) -> (Option<AskDecision>, egui::Rect) {
+fn ask_panel_ui(
+    ui: &mut egui::Ui,
+    ask: &AskRequest,
+    ask_text: egui::Color32,
+    plate: egui::Color32,
+) -> (Option<AskDecision>, egui::Rect) {
     let title = ask_title(ask);
     let title_color = if ask.wrong_yo || ask.replaced_yo || ask.wrong_ye {
         COLOR_ALERT
@@ -1443,7 +2638,12 @@ fn ask_panel_ui(ui: &mut egui::Ui, ask: &AskRequest) -> (Option<AskDecision>, eg
     let mut decision = None;
     let mut row = egui::Rect::NOTHING;
 
-    ui.add_space(8.0);
+    ui.add_space(6.0);
+    // Живой контекст слова — вместо статичной подсказки: слева и справа от
+    // спорного слова, как `reAskText`/`FindContext` оригинала. Слово
+    // подсвечено цветом из настроек; строка обрезается по ширине окна.
+    ui.add(egui::Label::new(ask_context_job(ask, ask_text, plate)).truncate());
+    ui.add_space(4.0);
     ui.vertical_centered(|ui| {
         egui::Frame::group(ui.style())
             .inner_margin(egui::Margin::same(10))
@@ -1583,11 +2783,8 @@ impl YoApp {
         }
         let mut open = true;
         let mut close = false;
-        let title = if self.dialog.is_save {
-            "Сохранить текст"
-        } else {
-            "Загрузить текст"
-        };
+        let title = self.dialog.title();
+        let is_text = self.dialog.purpose == FilePurpose::Text;
 
         let mut action: Option<FileAction> = None;
         let mut new_dir: Option<PathBuf> = None;
@@ -1595,18 +2792,16 @@ impl YoApp {
         egui::Window::new(title)
             .open(&mut open)
             .resizable(true)
-            .default_size([580.0, 420.0])
+            .default_size([640.0, 460.0])
             .show(ctx, |ui| {
-                // ── путь ───────────────────────────────────────────────
-                ui.horizontal(|ui| {
-                    ui.label("Папка:");
-                    let mut dir_str = self.dialog.dir.to_string_lossy().to_string();
-                    let r = ui.add_sized(
-                        [ui.available_width() - 60.0, 20.0],
-                        egui::TextEdit::singleline(&mut dir_str),
-                    );
-                    if r.lost_focus() {
-                        new_dir = Some(PathBuf::from(dir_str));
+                // ── диски и быстрые переходы ───────────────────────────────
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Диск:");
+                    for (label, path) in system_roots() {
+                        let here = self.dialog.dir == path;
+                        if ui.selectable_label(here, label).clicked() {
+                            new_dir = Some(path);
+                        }
                     }
                     if ui.button("↑").on_hover_text("На уровень выше").clicked() {
                         if let Some(p) = self.dialog.dir.parent() {
@@ -1615,27 +2810,68 @@ impl YoApp {
                     }
                 });
 
+                // ── путь ───────────────────────────────────────────────
+                ui.horizontal(|ui| {
+                    ui.label("Папка:");
+                    let mut dir_str = self.dialog.dir.to_string_lossy().to_string();
+                    let r = ui.add_sized(
+                        [ui.available_width(), 20.0],
+                        egui::TextEdit::singleline(&mut dir_str),
+                    );
+                    if r.lost_focus() {
+                        new_dir = Some(PathBuf::from(dir_str));
+                    }
+                });
+
                 // ── имя и кодировка ────────────────────────────────────
                 ui.horizontal(|ui| {
                     ui.label("Имя:");
-                    ui.add_sized(
-                        [ui.available_width() - 180.0, 20.0],
+                    let width = if is_text {
+                        ui.available_width() - 190.0
+                    } else {
+                        ui.available_width()
+                    };
+                    let r = ui.add_sized(
+                        [width.max(120.0), 20.0],
                         egui::TextEdit::singleline(&mut self.dialog.name),
                     );
-                    ui.label("Кодировка:");
-                    ui.menu_button(self.dialog.encoding.label(), |ui| {
-                        for enc in TextEncoding::ALL {
-                            ui.selectable_value(&mut self.dialog.encoding, enc, enc.label());
-                        }
-                    });
+                    if is_text {
+                        ui.label("Кодировка:");
+                        ui.menu_button(self.dialog.encoding.label(), |ui| {
+                            for enc in TextEncoding::ALL {
+                                ui.selectable_value(&mut self.dialog.encoding, enc, enc.label());
+                            }
+                        });
+                    }
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        action = Some(if self.dialog.is_save {
+                            FileAction::Save(self.dialog.path(), self.dialog.encoding)
+                        } else {
+                            self.dialog_action_for(self.dialog.path())
+                        });
+                    }
                 });
                 ui.separator();
 
                 // ── список ─────────────────────────────────────────────
-                let entries = self.dialog.entries.clone();
+                let exts: Option<Vec<&'static str>> = if is_text {
+                    None
+                } else {
+                    Some(self.dialog.purpose.extensions().to_vec())
+                };
+                if !self.dialog.dir.is_dir() {
+                    ui.colored_label(COLOR_MARK, "нет такой папки");
+                    new_dir = Some(std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")));
+                }
+                let entries = list_dir_filtered(&self.dialog.dir, exts.as_deref());
+                let purpose = self.dialog.purpose;
+                let is_save = self.dialog.is_save;
+                let dir = self.dialog.dir.clone();
+                let enc = self.dialog.encoding;
                 ui.push_id("file_list", |ui| {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
+                        .max_height(ui.available_height() - 40.0)
                         .show(ui, |ui| {
                             for (name, is_dir) in entries {
                                 let label = if is_dir {
@@ -1650,18 +2886,22 @@ impl YoApp {
                                 );
                                 if resp.double_clicked() {
                                     if is_dir {
-                                        new_dir = Some(self.dialog.dir.join(&name));
+                                        new_dir = Some(dir.join(&name));
                                     } else {
-                                        action = Some(if self.dialog.is_save {
-                                            FileAction::Save(
-                                                self.dialog.dir.join(&name),
-                                                self.dialog.encoding,
-                                            )
+                                        let path = dir.join(&name);
+                                        action = Some(if is_save {
+                                            FileAction::Save(path, enc)
                                         } else {
-                                            FileAction::Load(
-                                                self.dialog.dir.join(&name),
-                                                self.dialog.encoding,
-                                            )
+                                            match purpose {
+                                                FilePurpose::Text => FileAction::Load(path, enc),
+                                                FilePurpose::Dictionary => {
+                                                    FileAction::OpenDictionary(path)
+                                                }
+                                                FilePurpose::RegexDictionary => {
+                                                    FileAction::OpenRegexDictionary(path)
+                                                }
+                                                FilePurpose::Font => FileAction::OpenFont(path),
+                                            }
                                         });
                                     }
                                 } else if resp.clicked() {
@@ -1673,16 +2913,18 @@ impl YoApp {
 
                 ui.separator();
                 ui.horizontal(|ui| {
-                    let ok = if self.dialog.is_save {
+                    let ok = if is_save {
                         "Сохранить"
-                    } else {
+                    } else if purpose == FilePurpose::Text {
                         "Открыть"
+                    } else {
+                        "Загрузить"
                     };
                     if ui.button(ok).clicked() {
-                        action = Some(if self.dialog.is_save {
+                        action = Some(if is_save {
                             FileAction::Save(self.dialog.path(), self.dialog.encoding)
                         } else {
-                            FileAction::Load(self.dialog.path(), self.dialog.encoding)
+                            self.dialog_action_for(self.dialog.path())
                         });
                     }
                     if ui.button("Отмена").clicked() {
@@ -1697,8 +2939,12 @@ impl YoApp {
         // `open` снимается крестиком окна, `close` — кнопкой «Отмена».
         let mut open = open && !close;
         if let Some(d) = new_dir {
-            self.dialog.dir = d;
-            self.dialog.refresh();
+            if d.is_dir() {
+                self.dialog.dir = d;
+                self.dialog.refresh();
+            } else {
+                self.dialog.status = "это не папка".to_owned();
+            }
         }
         if let Some(a) = action {
             match a {
@@ -1718,9 +2964,426 @@ impl YoApp {
                         self.dialog.status = "нет такой папки".to_owned();
                     }
                 }
+                FileAction::OpenDictionary(p) => {
+                    if let Some(dict) = load_dictionary(&p) {
+                        self.dict_override = Some(dict);
+                        self.dictionary_path = Some(p.clone());
+                        self.status_left =
+                            format!("основной словарь: {} слов ({})", dict.len(), dict.version());
+                        open = false;
+                    } else {
+                        self.dialog.status = "не словарь YOX".to_owned();
+                    }
+                }
+                FileAction::OpenRegexDictionary(p) => {
+                    if let Some(re) = load_regex_dictionary(&p) {
+                        self.re_override = Some(re);
+                        self.regex_dict_path = Some(p.clone());
+                        self.status_left = format!(
+                            "словарь регулярных выражений: {} правил ({})",
+                            re.len(),
+                            re.version()
+                        );
+                        open = false;
+                    } else {
+                        self.dialog.status = "не словарь регулярных выражений".to_owned();
+                    }
+                }
+                FileAction::OpenFont(p) => {
+                    if p.is_file() {
+                        self.adopt_font_file(p);
+                        open = false;
+                    } else {
+                        self.dialog.status = "это не файл".to_owned();
+                    }
+                }
             }
         }
         self.dialog.open = open;
+    }
+
+    /// Действие «Открыть» для текущего назначения диалога.
+    fn dialog_action_for(&self, path: PathBuf) -> FileAction {
+        if self.dialog.is_save {
+            return FileAction::Save(path, self.dialog.encoding);
+        }
+        match self.dialog.purpose {
+            FilePurpose::Text => FileAction::Load(path, self.dialog.encoding),
+            FilePurpose::Dictionary => FileAction::OpenDictionary(path),
+            FilePurpose::RegexDictionary => FileAction::OpenRegexDictionary(path),
+            FilePurpose::Font => FileAction::OpenFont(path),
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Поиск
+    // ────────────────────────────────────────────────────────────────────
+
+    fn find_window(&mut self, ctx: &egui::Context) {
+        if !self.show_find {
+            return;
+        }
+        let mut open = true;
+        let mut close = false;
+        let mut forward = false;
+        let mut backward = false;
+        egui::Window::new(if self.find.regex {
+            "Найти регулярное выражение"
+        } else {
+            "Найти"
+        })
+        .open(&mut open)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Что найти:");
+                let r = ui.add_sized(
+                    [260.0, 20.0],
+                    egui::TextEdit::singleline(&mut self.find.query),
+                );
+                if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    forward = true;
+                }
+            });
+            ui.checkbox(&mut self.find.regex, "Регулярное выражение");
+            ui.checkbox(&mut self.find.case_sensitive, "Учитывать регистр");
+            if let Some(err) = &self.find.error {
+                ui.colored_label(COLOR_MARK, err.as_str());
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                if ui.button("Найти вперёд").clicked() {
+                    forward = true;
+                }
+                if ui.button("Найти назад").clicked() {
+                    backward = true;
+                }
+                if ui.button("Закрыть").clicked() {
+                    close = true;
+                }
+            });
+        });
+        if close {
+            open = false;
+        }
+        if forward {
+            self.find_again(ctx, true);
+        }
+        if backward {
+            self.find_again(ctx, false);
+        }
+        self.show_find = open;
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Шрифт
+    // ────────────────────────────────────────────────────────────────────
+
+    fn open_font_dialog(&mut self) {
+        self.show_font_dialog = true;
+    }
+
+    /// Применить `self.font_spec` к контексту (пересобрать шрифты).
+    fn apply_fonts(&mut self, ctx: &egui::Context) {
+        self.font_spec = self.font_spec.clone().sanitized();
+        self.editor_font = install_fonts(ctx, &self.font_spec);
+        ctx.request_repaint();
+    }
+
+    /// Взять шрифт из файла: семейство — имя файла, начертание — по имени.
+    fn adopt_font_file(&mut self, path: PathBuf) {
+        let name = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Свой шрифт".to_owned());
+        let lc = name.to_lowercase();
+        let bold = lc.contains("bold") || lc.contains("black") || lc.contains("heavy");
+        let italic = lc.contains("italic") || lc.contains("oblique");
+        self.font_spec.file = Some(path);
+        self.font_spec.family = name;
+        self.font_spec.style = match (bold, italic) {
+            (true, true) => FontStyle::BoldItalic,
+            (true, false) => FontStyle::Bold,
+            (false, true) => FontStyle::Italic,
+            (false, false) => FontStyle::Regular,
+        };
+        self.status_left = format!("шрифт редактора: {}", self.font_spec.family);
+    }
+
+    fn font_window(&mut self, ctx: &egui::Context) {
+        if !self.show_font_dialog {
+            return;
+        }
+        // Список системных шрифтов читается один раз — при первом открытии
+        // диалога, а не на старте: приложение не должно зависеть от того,
+        // сколько шрифтов установлено.
+        if !self.font_catalog_scanned {
+            self.font_catalog = FontCatalog::scan();
+            self.font_catalog_scanned = true;
+        }
+        let mut open = true;
+        let mut close = false;
+        let mut changed = false;
+
+        egui::Window::new("Шрифт редактора")
+            .open(&mut open)
+            .resizable(false)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label("Семейство:");
+                    let current = self.font_spec.family.clone();
+                    egui::ComboBox::from_id_salt("font_family")
+                        .selected_text(current.clone())
+                        .width(240.0)
+                        .show_ui(ui, |ui| {
+                            for (name, hint) in [
+                                ("Hack", "моноширинный, встроенный"),
+                                ("Ubuntu Light", "пропорциональный, встроенный"),
+                            ] {
+                                let selected = self.font_spec.family == name;
+                                if ui
+                                    .selectable_label(selected, format!("{name} — {hint}"))
+                                    .clicked()
+                                {
+                                    self.font_spec.family = name.to_owned();
+                                    self.font_spec.file = None;
+                                    changed = true;
+                                }
+                            }
+                            if self.font_spec.file.is_some() {
+                                let _ = ui.selectable_label(true, current);
+                            }
+                        });
+                });
+                if self.font_catalog_scanned {
+                    ui.horizontal(|ui| {
+                        ui.label("Установленные:");
+                        let families = self.font_catalog.families();
+                        egui::ComboBox::from_id_salt("font_system")
+                            .selected_text(if families.is_empty() {
+                                "не найдено"
+                            } else {
+                                "выбрать…"
+                            })
+                            .width(240.0)
+                            .show_ui(ui, |ui| {
+                                for family in families {
+                                    if ui.selectable_label(false, &family).clicked() {
+                                        let style = self.font_spec.style;
+                                        if let Some(face) = self.font_catalog.best(&family, style) {
+                                            self.font_spec.family = family.clone();
+                                            self.font_spec.file = Some(face.path.clone());
+                                            changed = true;
+                                        }
+                                    }
+                                }
+                            });
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Начертание:");
+                    egui::ComboBox::from_id_salt("font_style")
+                        .selected_text(self.font_spec.style.label())
+                        .width(240.0)
+                        .show_ui(ui, |ui| {
+                            for style in FontStyle::ALL {
+                                if ui
+                                    .selectable_label(self.font_spec.style == style, style.label())
+                                    .clicked()
+                                {
+                                    self.font_spec.style = style;
+                                    // Если семейство взято из системного
+                                    // каталога, подбираем файл нужного
+                                    // начертания (обычный/курсив/жирный).
+                                    if let Some(face) =
+                                        self.font_catalog.best(&self.font_spec.family, style)
+                                    {
+                                        self.font_spec.file = Some(face.path.clone());
+                                    }
+                                    changed = true;
+                                }
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Размер:");
+                    let mut size = self.font_spec.size;
+                    if ui
+                        .add(
+                            egui::Slider::new(&mut size, MIN_FONT_SIZE..=MAX_FONT_SIZE)
+                                .step_by(0.5)
+                                .suffix(" пт"),
+                        )
+                        .changed()
+                    {
+                        self.font_spec.size = size;
+                        changed = true;
+                    }
+                });
+                ui.horizontal(|ui| {
+                    if ui.button("Загрузить из файла…").clicked() {
+                        self.dialog.open_for(FilePurpose::Font, None);
+                    }
+                    if self.font_spec.file.is_some() && ui.button("Встроенный шрифт").clicked()
+                    {
+                        self.font_spec.file = None;
+                        self.font_spec.family = "Hack".to_owned();
+                        self.font_spec.style = FontStyle::Regular;
+                        changed = true;
+                    }
+                });
+                if let Some(file) = &self.font_spec.file {
+                    ui.label(
+                        egui::RichText::new(format!("файл: {}", file.display()))
+                            .small()
+                            .color(COLOR_DIM),
+                    );
+                }
+                ui.separator();
+                // Живой пример — тем же шрифтом, что и в редакторе.
+                let preview = egui::RichText::new(
+                    "Съешь же ещё этих мягких французских булок, да выпей чаю. № 42",
+                )
+                .font(self.editor_font.font_id());
+                ui.label(preview);
+                ui.separator();
+                if ui.button("Закрыть").clicked() {
+                    close = true;
+                }
+            });
+
+        if changed {
+            self.apply_fonts(ctx);
+        }
+        self.show_font_dialog = open && !close;
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Цвета подсветки
+    // ────────────────────────────────────────────────────────────────────
+
+    fn colors_window(&mut self, ctx: &egui::Context) {
+        if !self.show_colors {
+            return;
+        }
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("Цвета подсветки")
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let mut text = color32(self.mark_text);
+                let mut bg = color32(self.mark_bg);
+                let mut ask = color32(self.ask_text);
+                let mut plate = color32a(self.ask_plate);
+
+                ui.horizontal(|ui| {
+                    ui.label("Изменённые буквы:");
+                    if ui.color_edit_button_srgba(&mut text).changed() {
+                        self.mark_text = rgb_of(text);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Плашка под ними:");
+                    if ui.color_edit_button_srgba(&mut bg).changed() {
+                        self.mark_bg = rgb_of(bg);
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("Спорное слово:");
+                    if ui.color_edit_button_srgba(&mut ask).changed() {
+                        self.ask_text = rgb_of(ask);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Плашка запроса:");
+                    if ui.color_edit_button_srgba(&mut plate).changed() {
+                        self.ask_plate = rgba_of(plate);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Толщина подчёркивания:");
+                    ui.add(
+                        egui::Slider::new(&mut self.ask_underline, 0.0..=6.0)
+                            .step_by(0.25)
+                            .suffix(" пт"),
+                    );
+                });
+                ui.separator();
+                if ui.button("По умолчанию").clicked() {
+                    let d = GuiSettings::default();
+                    self.mark_text = d.mark_text;
+                    self.mark_bg = d.mark_bg;
+                    self.ask_text = d.ask_text;
+                    self.ask_plate = d.ask_plate;
+                    self.ask_underline = d.ask_underline;
+                }
+                if ui.button("Закрыть").clicked() {
+                    close = true;
+                }
+            });
+        self.show_colors = open && !close;
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    //  Свойства файла
+    // ────────────────────────────────────────────────────────────────────
+
+    fn props_window(&mut self, ctx: &egui::Context) {
+        if !self.show_props {
+            return;
+        }
+        let mut open = true;
+        let props = self.props.clone();
+        egui::Window::new("Свойства файла")
+            .open(&mut open)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let Some(p) = props else {
+                    ui.label("файл не загружен");
+                    return;
+                };
+                egui::Grid::new("props_grid")
+                    .num_columns(2)
+                    .spacing([16.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("Файл:");
+                        ui.label(
+                            p.path
+                                .as_ref()
+                                .map(|x| x.display().to_string())
+                                .unwrap_or_else(|| "—".to_owned()),
+                        );
+                        ui.end_row();
+                        ui.label("Существует:");
+                        ui.label(if p.exists { "да" } else { "нет" });
+                        ui.end_row();
+                        ui.label("Размер:");
+                        ui.label(format!("{} Б", p.size));
+                        ui.end_row();
+                        ui.label("Изменён:");
+                        ui.label(match p.modified {
+                            Some(t) => format_system_time(t),
+                            None => "—".to_owned(),
+                        });
+                        ui.end_row();
+                        ui.label("Кодировка:");
+                        ui.label(p.encoding.label());
+                        ui.end_row();
+                        ui.label("Символов:");
+                        ui.label(p.chars.to_string());
+                        ui.end_row();
+                        ui.label("Слов:");
+                        ui.label(p.words.to_string());
+                        ui.end_row();
+                        ui.label("Строк:");
+                        ui.label(p.lines.to_string());
+                        ui.end_row();
+                    });
+            });
+        self.show_props = open;
     }
 
     fn options_window(&mut self, ctx: &egui::Context) {
@@ -1732,53 +3395,45 @@ impl YoApp {
         egui::Window::new("Опции")
             .open(&mut open)
             .resizable(false)
-            .default_size([540.0, 440.0])
+            .default_size([560.0, 520.0])
             .show(ctx, |ui| {
                 ui.heading("Ёфикация");
-                let o = &mut self.opts;
-                ui.checkbox(
-                    &mut o.reg_exprs,
-                    "Использование словаря регулярных выражений",
-                );
-                ui.checkbox(&mut o.no_var_only, "Только безопасные замены");
-                ui.checkbox(&mut o.var_only, "Только интерактивные замены");
-                ui.checkbox(&mut o.check_yo, "Проверять расстановку «ё»");
-                ui.checkbox(&mut o.always_ask, "Всегда подтверждать замену");
-                ui.checkbox(&mut o.to_confirm_abbr, "…подтверждать для сокращений");
-                ui.checkbox(&mut o.to_confirm_cap, "…подтверждать для имён собственных");
-                ui.checkbox(
-                    &mut o.to_confirm_ellipsis,
-                    "…подтверждать для оборванных слов",
-                );
-                ui.checkbox(&mut o.propose_last, "Предлагать последний вариант замены");
-                ui.checkbox(&mut o.fb_format, "Учитывать формат «FictionBook»");
-                ui.checkbox(&mut o.fast_scroll, "Быстрая прокрутка");
-                ui.horizontal(|ui| {
-                    ui.label("Количество строк проматки:");
-                    let mut n = o.lines_below as i32;
-                    ui.add(egui::DragValue::new(&mut n).range(0..=20));
-                    o.lines_below = n.max(0) as usize;
-                });
+                self.yofication_options(ui);
                 ui.horizontal(|ui| {
                     ui.label("Неоднозначные слова:");
-                    for p in AmbiguousPolicy::ALL {
-                        ui.radio_value(&mut o.ambiguous, p, p.label());
+                    for policy in AmbiguousPolicy::ALL {
+                        ui.radio_value(&mut self.opts.ambiguous, policy, policy.label());
                     }
                 });
 
                 ui.separator();
                 ui.heading("Редактор");
-                ui.checkbox(&mut o.mark, "Помечать исправленное");
-                ui.checkbox(&mut o.word_wrap, "Переносить текст по словам");
-                ui.checkbox(&mut o.auto_unicode, "Автораспознавание Unicode");
-                ui.checkbox(&mut o.last_file, "Помнить последний файл");
-                ui.checkbox(&mut self.highlight, "Подсвечивать замены в тексте");
-                ui.checkbox(&mut self.show_journal, "Вести журнал замен");
+                self.editor_options(ui);
 
                 ui.separator();
                 ui.horizontal(|ui| {
+                    if ui.button("Шрифт…").clicked() {
+                        self.show_font_dialog = true;
+                    }
+                    if ui.button("Цвета подсветки…").clicked() {
+                        self.show_colors = true;
+                    }
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
                     if ui.button("По умолчанию").clicked() {
-                        self.opts = YoOptions::default();
+                        let d = GuiSettings::default();
+                        self.opts = d.opts;
+                        self.dark = d.dark;
+                        self.highlight = d.highlight;
+                        self.show_journal = d.show_journal;
+                        self.mark_text = d.mark_text;
+                        self.mark_bg = d.mark_bg;
+                        self.ask_text = d.ask_text;
+                        self.ask_plate = d.ask_plate;
+                        self.ask_underline = d.ask_underline;
+                        self.font_spec = d.font;
+                        self.apply_fonts(ctx);
                     }
                     if ui.button("Закрыть").clicked() {
                         close = true;
@@ -1793,13 +3448,21 @@ impl YoApp {
             return;
         }
         let mut open = true;
-        let (words, dic_version, rules, re_version, ms) = match &self.dict_info {
-            Some(v) => v.clone(),
-            None => {
-                let (w, dv, r, rv) = database_info();
-                (w, dv, r, rv, 0u128)
-            }
+        // Активные базы: встроенные или загруженные пользователем.
+        let (words, dic_version, rules, re_version) = {
+            let dict = self.dict_override.unwrap_or_else(yol::yo_core::dictionary);
+            let re = self
+                .re_override
+                .unwrap_or_else(yol::yo_core::regex_dictionary);
+            (
+                dict.len(),
+                dict.version().to_owned(),
+                re.len(),
+                re.version().to_owned(),
+            )
         };
+        let ms = self.dict_info.as_ref().map(|v| v.4).unwrap_or(0);
+        let _ = database_info;
         egui::Window::new("О программе")
             .open(&mut open)
             .resizable(false)
@@ -2249,7 +3912,21 @@ YOL — «Ё лайт»: ёфикация русских текстов
         --fb2                  учитывать формат FictionBook
         --no-mark              не помечать исправленное
         --ambiguous <политика> что делать с неоднозначными словами:
-                               yo (ставить Ё, по умолчанию) | ye (оставить Е) | ask
+                               yo (ставить Ё, по умолчанию в консоли) |
+                               ye (оставить Е) | ask (спрашивать)
+
+ИНТЕРФЕЙС
+    Настройки читаются из yo.ini рядом с программой (YOL_INI задаёт другой
+    путь) и сохраняются при выходе. В графическом режиме неоднозначные
+    слова по умолчанию требуют ответа («Спрашивать»).
+
+    Ctrl+L           загрузить текст          Ctrl+P  свойства файла
+    Ctrl+S           сохранить как…           Ctrl+Alt+S  сохранить
+    F9 / Ctrl+F9     ёфицировать с позиции / с начала
+    Shift+F10        убрать подсветку замен
+    Ctrl+F/R, F3     найти / найти регэксп / найти снова
+    Ctrl+W / Ctrl+Q  искать замену вперёд / назад
+    Ctrl+O           опции                    Esc  прервать ёфикацию
 ";
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -2370,6 +4047,40 @@ mod app_tests {
     }
 
     #[test]
+    fn yofication_can_start_from_the_cursor() {
+        let mut app = app();
+        let src = "Актер вышел на сцену. Актер снова вышел.";
+        app.text = src.to_owned();
+        app.text_chars = app.text.chars().count();
+        let from = src.find("Актер снова").expect("вторая половина");
+        app.start_at(from);
+        assert!(app.busy(), "прогон не начался");
+        wait(&mut app);
+
+        assert_eq!(
+            app.text, "Актер вышел на сцену. Актёр снова вышел.",
+            "текст до курсора должен остаться нетронутым"
+        );
+    }
+
+    #[test]
+    fn remove_marks_and_clear_text_reset_the_view() {
+        let mut app = app();
+        app.text = "Актер вышел.".to_owned();
+        app.text_chars = app.text.chars().count();
+        app.marks.push((0, 5));
+        app.journal.push(("Актер".into(), "Актёр".into()));
+        app.remove_marks();
+        assert!(app.marks.is_empty());
+
+        app.clear_text();
+        assert!(app.text.is_empty());
+        assert_eq!(app.text_chars, 0);
+        assert!(app.journal.is_empty());
+        assert!(app.current_file.is_none());
+    }
+
+    #[test]
     fn ask_pauses_the_run_and_points_at_the_word() {
         let mut app = app();
         app.opts.always_ask = true;
@@ -2473,6 +4184,9 @@ mod gui_tests {
     use super::*;
     use egui::{pos2, vec2, Context, RawInput, Rect};
 
+    const ASK_TEXT_TEST: egui::Color32 = egui::Color32::from_rgb(255, 214, 150);
+    const ASK_PLATE_TEST: egui::Color32 = egui::Color32::from_rgba_premultiplied(70, 52, 10, 70);
+
     fn ask() -> AskRequest {
         AskRequest {
             word1: "актер".into(),
@@ -2517,7 +4231,7 @@ mod gui_tests {
             let mut inner = (None, Rect::NOTHING);
             let _ = ctx.run(raw(screen, frame as f64 * 0.016), |ctx| {
                 egui::TopBottomPanel::bottom("ask_panel").show(ctx, |ui| {
-                    inner = ask_panel_ui(ui, ask);
+                    inner = ask_panel_ui(ui, ask, ASK_TEXT_TEST, ASK_PLATE_TEST);
                 });
             });
             result = inner;
@@ -2622,7 +4336,7 @@ mod gui_tests {
         for frame in 0..2 {
             let _ = ctx.run(raw(screen, frame as f64 * 0.016), |ctx| {
                 egui::TopBottomPanel::bottom("ask_panel").show(ctx, |ui| {
-                    row = ask_panel_ui(ui, &a).1;
+                    row = ask_panel_ui(ui, &a, ASK_TEXT_TEST, ASK_PLATE_TEST).1;
                 });
             });
         }
@@ -2635,7 +4349,7 @@ mod gui_tests {
             input.events = click_events(pos, pressed);
             let _ = ctx.run(input, |ctx| {
                 egui::TopBottomPanel::bottom("ask_panel").show(ctx, |ui| {
-                    let (d, _) = ask_panel_ui(ui, &a);
+                    let (d, _) = ask_panel_ui(ui, &a, ASK_TEXT_TEST, ASK_PLATE_TEST);
                     if d.is_some() {
                         clicked = d;
                     }
@@ -2668,7 +4382,7 @@ mod gui_tests {
                         .id(id)
                         .interactive(false)
                         .show(ui);
-                    paint_ask_word(ui, &out, range);
+                    paint_ask_word(ui, &out, range, ASK_PLATE_TEST, 1.5);
                     let s = out
                         .galley
                         .pos_from_cursor(&out.galley.from_ccursor(CCursor::new(range.0)))
@@ -2690,14 +4404,14 @@ mod gui_tests {
                     .id(id)
                     .interactive(false)
                     .show(ui);
-                paint_ask_word(ui, &out, range);
+                paint_ask_word(ui, &out, range, ASK_PLATE_TEST, 1.5);
             });
         });
         let plaques: Vec<Rect> = out
             .shapes
             .iter()
             .filter_map(|cs| match &cs.shape {
-                egui::epaint::Shape::Rect(r) if r.fill == COLOR_ASK_BG => Some(r.rect),
+                egui::epaint::Shape::Rect(r) if r.fill == ASK_PLATE_TEST => Some(r.rect),
                 _ => None,
             })
             .collect();
@@ -2712,5 +4426,195 @@ mod gui_tests {
                 && (r.center().x - expected.center().x).abs() < expected.width() / 2.0),
             "плашка {plaques:?} не совпала со словом {expected:?}"
         );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Тесты вспомогательных функций и настроек
+// ═══════════════════════════════════════════════════════════════════════════
+
+#[cfg(test)]
+mod helper_tests {
+    use super::*;
+
+    #[test]
+    fn char_and_byte_offsets_agree_on_cyrillic() {
+        let text = "Ёж, ёлка и ёрш";
+        for (i, (byte, _)) in text.char_indices().enumerate() {
+            assert_eq!(char_to_byte(text, i), byte);
+            assert_eq!(byte_to_char(text, byte), i);
+        }
+        assert_eq!(char_to_byte(text, text.chars().count()), text.len());
+        assert_eq!(byte_to_char(text, text.len()), text.chars().count());
+    }
+
+    #[test]
+    fn text_find_walks_forward_and_back_with_wrap() {
+        let text = "актер Актер актёр";
+        // Вперёд с нуля — первое вхождение.
+        assert_eq!(text_find(text, "актер", 0, true, false), Some((0, 5)));
+        // Вперёд со второго символа — следующее (регистр не важен).
+        assert_eq!(text_find(text, "актер", 1, true, false), Some((6, 11)));
+        // Учитывая регистр, «Актер» не совпадает с «актер» — остаётся
+        // только зацикленное вхождение в начале строки.
+        assert_eq!(text_find(text, "актер", 1, true, true), Some((0, 5)));
+        // Назад из конца — последнее вхождение.
+        assert_eq!(
+            text_find(text, "актер", text.chars().count(), false, false),
+            Some((6, 11))
+        );
+        // Зацикливание вперёд: после конца начинаем с начала.
+        assert_eq!(text_find(text, "актер", 7, true, false), Some((0, 5)));
+        // Зацикливание назад: раньше нуля продолжаем с конца.
+        assert_eq!(text_find(text, "актер", 0, false, false), Some((6, 11)));
+        assert_eq!(text_find(text, "", 0, true, false), None);
+    }
+
+    #[test]
+    fn regex_find_reports_errors_and_matches() {
+        let text = "актер Актер актёр";
+        let m = regex_find(text, "акт[её]р", 0, true, true).unwrap();
+        assert_eq!(m, Some((0, 5)));
+        // Назад от конца — «актёр» (последнее совпадение).
+        let m = regex_find(text, "акт[её]р", text.chars().count(), false, true).unwrap();
+        assert_eq!(m, Some((12, 17)));
+        // Кривое выражение — ошибка, а не паника.
+        assert!(regex_find(text, "[", 0, true, false).is_err());
+    }
+
+    #[test]
+    fn system_roots_are_usable_directories() {
+        let roots = system_roots();
+        assert!(!roots.is_empty(), "должен быть хотя бы один корень");
+        for (label, path) in roots {
+            assert!(!label.is_empty());
+            assert!(path.is_dir(), "корень {label} не каталог");
+        }
+    }
+
+    #[test]
+    fn list_dir_filtered_shows_only_matching_files() {
+        let dir = std::env::temp_dir().join(format!("yol-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        std::fs::write(dir.join("b.dat"), b"x").unwrap();
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+
+        let all = list_dir_filtered(&dir, None);
+        assert!(all.iter().any(|(n, d)| n == "b.dat" && !d));
+        assert!(all.iter().any(|(n, d)| n == "sub" && *d));
+
+        let only_txt = list_dir_filtered(&dir, Some(&["txt"]));
+        assert!(only_txt.iter().any(|(n, _)| n == "a.txt"));
+        assert!(!only_txt.iter().any(|(n, _)| n == "b.dat"));
+        // Папки видны всегда, иначе из каталога не выбраться.
+        assert!(only_txt.iter().any(|(n, d)| n == "sub" && *d));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_props_counts_words_and_lines() {
+        let text = "Актер вышел.\nБереза стоит.";
+        let props = FileProps::collect(None, text, TextEncoding::Utf8Bom);
+        assert_eq!(props.chars, text.chars().count());
+        assert_eq!(props.lines, 2);
+        assert_eq!(props.words, 4);
+        assert!(!props.exists);
+        assert_eq!(props.size, 0);
+    }
+
+    #[test]
+    fn format_system_time_renders_the_epoch() {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(0);
+        assert_eq!(format_system_time(t), "1970-01-01 00:00");
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        assert_eq!(format_system_time(t), "2023-11-14 22:13");
+    }
+
+    #[test]
+    fn dictionary_variants_keep_the_case_of_the_text() {
+        let dict = yol::yo_core::dictionary();
+        let (ye, yo) = dictionary_variants(dict, "актер").expect("слово есть в базе");
+        assert_eq!(ye, "актер");
+        assert_eq!(yo, "актёр");
+        let (ye, yo) = dictionary_variants(dict, "Актер").expect("слово есть в базе");
+        assert_eq!(ye, "Актер");
+        assert_eq!(yo, "Актёр");
+        assert!(dictionary_variants(dict, "мама").is_none());
+    }
+
+    #[test]
+    fn gui_defaults_ask_about_ambiguous_words() {
+        let app_ctx = egui::Context::default();
+        let app = YoApp::with_context(&app_ctx);
+        assert_eq!(app.opts.ambiguous, AmbiguousPolicy::Ask);
+        assert!(app.opts.interactive(), "панель запроса должна быть активна");
+        assert!(app.config_path.is_none(), "тесты не пишут yo.ini");
+        assert_eq!(app.font_spec.size, FontSpec::default().size);
+    }
+
+    #[test]
+    fn settings_snapshot_survives_an_ini_round_trip() {
+        let ctx = egui::Context::default();
+        let mut app = YoApp::with_context(&ctx);
+        app.opts.no_var_only = true;
+        app.opts.var_only = false;
+        app.dark = false;
+        app.highlight = false;
+        app.mark_text = Rgb::new(1, 2, 3);
+        app.mark_bg = Rgb::new(4, 5, 6);
+        app.ask_underline = 2.5;
+        app.font_spec.size = 21.0;
+        app.font_spec.style = FontStyle::Italic;
+        app.recent = vec![PathBuf::from("/tmp/один.txt")];
+
+        let snapshot = app.settings_snapshot();
+        let parsed = GuiSettings::parse(&snapshot.to_ini());
+        assert!(parsed.opts.no_var_only);
+        assert!(!parsed.opts.var_only);
+        assert!(!parsed.dark);
+        assert!(!parsed.highlight);
+        assert_eq!(parsed.mark_text, Rgb::new(1, 2, 3));
+        assert_eq!(parsed.mark_bg, Rgb::new(4, 5, 6));
+        assert_eq!(parsed.ask_underline, 2.5);
+        assert_eq!(parsed.font.size, 21.0);
+        assert_eq!(parsed.font.style, FontStyle::Italic);
+        assert_eq!(parsed.recent, vec![PathBuf::from("/tmp/один.txt")]);
+    }
+
+    #[test]
+    fn both_exclusive_modes_never_stay_on_together() {
+        let mut o = YoOptions::default();
+        o.set_no_var_only(true);
+        o.set_var_only(true);
+        assert!(
+            !o.no_var_only,
+            "включение «интерактивных» снимает «безопасные»"
+        );
+        o.set_no_var_only(true);
+        assert!(!o.var_only);
+
+        // Так же после чтения испорченного yo.ini.
+        let mut parsed = GuiSettings::parse("[Yo]\nNoVarOnly=1\nVarOnly=1\n");
+        assert!(parsed.opts.var_only && !parsed.opts.no_var_only);
+        parsed.opts.normalize();
+        assert!(parsed.opts.var_only && !parsed.opts.no_var_only);
+    }
+
+    #[test]
+    fn settings_file_is_written_next_to_the_given_path() {
+        let dir = std::env::temp_dir().join(format!("yol-ini-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("yo.ini");
+        let mut s = GuiSettings::default();
+        s.opts.always_ask = true;
+        s.recent = vec![PathBuf::from("/tmp/книга.fb2")];
+        s.save(&path).expect("файл должен записаться");
+        let read = GuiSettings::load(&path);
+        assert!(read.opts.always_ask);
+        assert_eq!(read.recent, vec![PathBuf::from("/tmp/книга.fb2")]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

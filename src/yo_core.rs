@@ -321,6 +321,25 @@ impl AmbiguousPolicy {
         }
     }
 
+    /// Короткое имя для `yo.ini`.
+    pub fn key(self) -> &'static str {
+        match self {
+            AmbiguousPolicy::Yo => "yo",
+            AmbiguousPolicy::Ye => "ye",
+            AmbiguousPolicy::Ask => "ask",
+        }
+    }
+
+    /// Разбор имени из `yo.ini` (понимает и русские подписи).
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "yo" | "ё" | "ставить ё" => Some(AmbiguousPolicy::Yo),
+            "ye" | "е" | "оставить е" => Some(AmbiguousPolicy::Ye),
+            "ask" | "спрашивать" => Some(AmbiguousPolicy::Ask),
+            _ => None,
+        }
+    }
+
     /// Номер варианта, подставляемый вместо ответа пользователя.
     #[inline]
     pub fn focus(self) -> u8 {
@@ -404,6 +423,33 @@ impl YoOptions {
     #[inline]
     pub fn interactive(&self) -> bool {
         self.always_ask || self.ambiguous == AmbiguousPolicy::Ask
+    }
+
+    /// «Только безопасные» и «только интерактивные» — взаимоисключающие
+    /// режимы: включение одного снимает другой (так же ведёт себя страница
+    /// опций оригинала, где второй флажок становится недоступным).
+    pub fn set_no_var_only(&mut self, on: bool) {
+        self.no_var_only = on;
+        if on {
+            self.var_only = false;
+        }
+    }
+
+    /// Симметрично [`Self::set_no_var_only`].
+    pub fn set_var_only(&mut self, on: bool) {
+        self.var_only = on;
+        if on {
+            self.no_var_only = false;
+        }
+    }
+
+    /// Восстановить инвариант после чтения файла настроек: одновременно
+    /// включёнными эти режимы быть не могут. Побеждает «только интерактивные»
+    /// — он задаёт более строгий фильтр.
+    pub fn normalize(&mut self) {
+        if self.no_var_only && self.var_only {
+            self.no_var_only = false;
+        }
     }
 }
 
@@ -1135,6 +1181,13 @@ struct Selection {
 /// Движок ёфикации. Долгоживущий, переиспользует все буферы.
 pub struct Engine {
     opts: YoOptions,
+    /// Активная база слов: встроенная либо загруженная из файла.
+    ///
+    /// Ссылка `'static` — словари живут до конца процесса (встроенные лежат
+    /// в `OnceLock`, загруженные утекают осознанно: их единицы на сеанс).
+    dict: &'static Dictionary,
+    /// Активная база регулярных выражений.
+    re: &'static RegexDict,
     stats: Stats,
 
     // ── буфер результата ─────────────────────────────────────────────────
@@ -1162,9 +1215,22 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// Движок со встроенными базами (обычный случай).
     pub fn new(opts: YoOptions) -> Self {
+        Self::with_databases(opts, dictionary(), regex_dictionary())
+    }
+
+    /// Движок с явно заданными базами: так GUI подставляет словари,
+    /// загруженные пользователем через меню «Файл».
+    pub fn with_databases(
+        opts: YoOptions,
+        dict: &'static Dictionary,
+        re: &'static RegexDict,
+    ) -> Self {
         Self {
             opts,
+            dict,
+            re,
             stats: Stats::default(),
             out: String::with_capacity(FLUSH_THRESHOLD + 8192),
             emitted: 0,
@@ -1183,6 +1249,12 @@ impl Engine {
             b_before: String::with_capacity(128),
             b_after: String::with_capacity(128),
         }
+    }
+
+    /// Активные базы: (слова, регулярные выражения).
+    #[inline]
+    pub fn databases(&self) -> (&'static Dictionary, &'static RegexDict) {
+        (self.dict, self.re)
     }
 
     #[inline]
@@ -1210,6 +1282,20 @@ impl Engine {
     /// наружу каждые 64 КБ — поэтому память остаётся ограниченной даже на
     /// стомегабайтных файлах, а интерфейс успевает отрисовывать прогресс.
     pub fn process(&mut self, input: &str, sink: &mut dyn Sink) -> Stats {
+        self.process_from(input, 0, sink)
+    }
+
+    /// Ёфицировать начиная с байтового смещения `from` — режим «с текущей
+    /// позиции» (F9) против «с начала текста» (Ctrl+F9).
+    ///
+    /// Всё, что левее `from`, попадает в результат без изменений: движок
+    /// просто копирует префикс и продолжает разбор с указанного места, так
+    /// что смещения в [`Sink::chunk`] остаются абсолютными.
+    ///
+    /// Если `from` попало внутрь слова, начало сдвигается к первой букве
+    /// этого слова: иначе движок принял бы обрывок («ктер») за отдельное
+    /// слово и мог бы испортить текст.
+    pub fn process_from(&mut self, input: &str, from: usize, sink: &mut dyn Sink) -> Stats {
         let t0 = std::time::Instant::now();
 
         self.stats = Stats::default();
@@ -1227,6 +1313,28 @@ impl Engine {
         };
         let (head, tail) = input.split_at(limit);
 
+        // Границы: не дальше проверяемой части, не в середине символа,
+        // не в середине слова.
+        let mut start = from.min(limit);
+        while start > 0 && !input.is_char_boundary(start) {
+            start -= 1;
+        }
+        if start > 0 {
+            let mut word_begin = start;
+            for (i, c) in input[..start].char_indices().rev() {
+                if is_alpha(c) {
+                    word_begin = i;
+                } else {
+                    break;
+                }
+            }
+            start = word_begin;
+        }
+
+        // Префикс переносим в результат как есть — он не ёфицируется.
+        self.out.push_str(&head[..start]);
+        self.stats.chars += head[..start].chars().count() as u64;
+
         let mut word_start = 0usize;
         let mut word_len = 0usize;
         let mut word_ye_yo = false;
@@ -1234,7 +1342,8 @@ impl Engine {
         let mut counter = 0u64;
         let mut stop_at = head.len();
 
-        for (idx, c) in head.char_indices() {
+        for (offset, c) in head[start..].char_indices() {
+            let idx = start + offset;
             if is_alpha(c) {
                 if self.word.is_empty() {
                     word_start = idx;
@@ -1476,7 +1585,7 @@ impl Engine {
         sink: &mut dyn Sink,
     ) -> Selection {
         let mut sel = Selection::default();
-        let dic = dictionary();
+        let dic = self.dict;
 
         // Word1 := ToYe(cWord)
         to_ye_into(c_word, &mut self.b_word1);
@@ -1548,7 +1657,7 @@ impl Engine {
 
         // Словарь регулярных выражений
         if self.opts.reg_exprs && to_ask {
-            let redic = regex_dictionary();
+            let redic = self.re;
             let di = self.build_context(input, word_start, word_end, c_word);
             let ctx = self.b_ctx.clone();
             let mut word_n = 0u8;
