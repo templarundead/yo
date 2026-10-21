@@ -2603,7 +2603,11 @@ fn paint_marks_overlay(
     let painter = ui.painter_at(out.text_clip_rect);
     let clip = out.text_clip_rect;
     for &(s, e) in marks {
-        if s >= text.len() || e > text.len() || !text.is_char_boundary(s) || !text.is_char_boundary(e) {
+        if s >= text.len()
+            || e > text.len()
+            || !text.is_char_boundary(s)
+            || !text.is_char_boundary(e)
+        {
             continue;
         }
         let start = byte_to_char(text, s);
