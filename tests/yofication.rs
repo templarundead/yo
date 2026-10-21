@@ -209,6 +209,56 @@ fn ask_request_points_at_the_word_in_the_single_buffer() {
     );
 }
 
+/// Приёмник, который запоминает, какой текст уже дошёл до него к моменту
+/// каждого вопроса: в редакторе это ровно то, что видит пользователь.
+#[derive(Default)]
+struct AskSnapshots {
+    text: String,
+    seen: Vec<(String, String)>,
+}
+
+impl Sink for AskSnapshots {
+    fn chunk(&mut self, base: usize, text: &str, _marks: &[(usize, usize)]) {
+        assert_eq!(base, self.text.len(), "куски должны идти по порядку");
+        self.text.push_str(text);
+    }
+
+    fn stats(&mut self, _stats: Stats) {}
+
+    fn ask(&mut self, req: AskRequest) -> AskDecision {
+        self.seen.push((self.text.clone(), req.word2.clone()));
+        AskDecision::Yo
+    }
+
+    fn undo(&mut self, _offset: usize, _old: &str, _new: &str) {}
+
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+/// Перед вопросом движок обязан отдать всё, что уже исправлено. Иначе
+/// пользователь отвечает «Ё», а в редакторе ничего не меняется до самого
+/// конца прогона (или до кнопки «Стоп») — ровно этот баг и был.
+#[test]
+fn answers_reach_the_sink_before_the_next_question() {
+    let mut engine = Engine::new(opts(|o| o.ambiguous = AmbiguousPolicy::Ask));
+    let mut sink = AskSnapshots::default();
+    engine.process("Он берет копье.", &mut sink);
+
+    let asked: Vec<&str> = sink.seen.iter().map(|(_, w)| w.as_str()).collect();
+    assert_eq!(asked, ["берёт", "копьё"], "оба слова должны спрашивать");
+    assert_eq!(
+        sink.seen[0].0, "Он ",
+        "до первого вопроса текст идёт без изменений"
+    );
+    assert_eq!(
+        sink.seen[1].0, "Он берёт ",
+        "ответ на первый вопрос должен быть виден ещё до второго"
+    );
+    assert_eq!(sink.text, "Он берёт копьё.");
+}
+
 fn opts(mutate: impl FnOnce(&mut YoOptions)) -> YoOptions {
     let mut o = YoOptions::default();
     mutate(&mut o);

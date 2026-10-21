@@ -1535,6 +1535,12 @@ impl Engine {
         }
         self.out.push_str(&result);
         self.history.push((offset, word.to_owned(), result));
+        if sel.asked {
+            // Ответ только что получен — показываем его сразу, не дожидаясь
+            // ни следующего вопроса, ни конца прогона (раньше замены «е»→«ё»
+            // появлялись в редакторе только после «Прервать»).
+            self.flush(sink);
+        }
         false
     }
 
@@ -1709,6 +1715,10 @@ impl Engine {
                 } else {
                     !is_yo_c_word || wrong_yo
                 };
+                // Перед вопросом отдаём наружу всё, что уже готово: панель
+                // запроса не должна «прятать» замены, сделанные до неё.
+                // Иначе ответ пользователя виден только после остановки.
+                self.flush(sink);
                 let req = AskRequest {
                     word1: self.b_word1.clone(),
                     word2: self.b_word2.clone(),

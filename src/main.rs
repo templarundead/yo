@@ -4080,6 +4080,45 @@ mod app_tests {
         assert!(app.current_file.is_none());
     }
 
+    /// Крутит `pump()`, пока движок не задаст вопрос.
+    fn wait_for_ask(app: &mut YoApp) -> AskRequest {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while app.ask.is_none() && Instant::now() < deadline {
+            app.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        app.ask.clone().expect("движок должен задать вопрос")
+    }
+
+    /// Ответ на панель запроса должен быть виден в буфере сразу — ещё до
+    /// следующего вопроса и до конца прогона. Иначе кажется, что кнопка «Ё»
+    /// ничего не делает, а замены «е» → «ё» появляются только после «Стоп».
+    #[test]
+    fn answer_is_shown_before_the_next_question() {
+        let mut app = app();
+        app.text = "Он берет копье.".to_owned();
+        app.text_chars = app.text.chars().count();
+        app.start();
+
+        let first = wait_for_ask(&mut app);
+        assert_eq!(first.word1, "берет");
+        assert_eq!(first.word2, "берёт");
+        app.answer(AskDecision::Yo);
+
+        let second = wait_for_ask(&mut app);
+        assert_eq!(second.word1, "копье");
+        assert!(app.busy(), "второй вопрос должен прийти до конца прогона");
+        assert!(
+            app.text.starts_with("Он берёт"),
+            "замена по ответу должна попасть в буфер сразу, а там: {:?}",
+            app.text
+        );
+
+        app.answer(AskDecision::Ye);
+        wait(&mut app);
+        assert_eq!(app.text, "Он берёт копье.");
+    }
+
     #[test]
     fn ask_pauses_the_run_and_points_at_the_word() {
         let mut app = app();
