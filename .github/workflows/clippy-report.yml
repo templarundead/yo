@@ -34,10 +34,15 @@ jobs:
         id: run
         run: |
           set +e
-          cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tee clippy.log
-          EC=$?
+          echo "=== clippy --all-targets --all-features ===" | tee clippy.log
+          cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tee -a clippy.log
+          EC1=$?
+          echo "=== clippy --all-targets ===" | tee -a clippy.log
+          cargo clippy --all-targets -- -D warnings 2>&1 | tee -a clippy.log
+          EC2=$?
+          EC=$((EC1 || EC2))
           echo "ec=$EC" >> $GITHUB_OUTPUT
-          if [ $EC -eq 0 ]; then echo "clippy ok"; else echo "clippy failed"; fi
+          if [ $EC -eq 0 ]; then echo "clippy ok"; else echo "clippy failed EC1=$EC1 EC2=$EC2"; fi
           exit $EC
         continue-on-error: true
 
