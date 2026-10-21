@@ -182,9 +182,15 @@ jobs:
         shell: pwsh
         run: |
           $bin = "target/${{ matrix.target }}/release/${{ matrix.binary }}"
-          & $bin --version
+          # Бинарник — GUI-подсистемы (`#![windows_subsystem = "windows"]`),
+          # поэтому PowerShell не дожидается его сам: запускаем через
+          # Start-Process -Wait и проверяем код возврата.
+          $p = Start-Process -FilePath $bin -ArgumentList '--version' -NoNewWindow -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "yol --version: код $($p.ExitCode)" }
           Set-Content -Path "$env:TEMP\smoke.txt" -Value 'Актер вышел на сцену, а береза стояла у елки.' -Encoding UTF8
-          & $bin -i "$env:TEMP\smoke.txt" -o "$env:TEMP\smoke.out.txt" -q --out-enc utf8
+          $args = @('-i', "`"$env:TEMP\smoke.txt`"", '-o', "`"$env:TEMP\smoke.out.txt`"", '-q', '--out-enc', 'utf8')
+          $p = Start-Process -FilePath $bin -ArgumentList $args -NoNewWindow -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "yol -i ...: код $($p.ExitCode)" }
           $out = Get-Content "$env:TEMP\smoke.out.txt" -Raw
           Write-Host $out
           if ($out -notmatch 'Актёр')  { throw "no Актёр" }
