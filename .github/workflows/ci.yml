@@ -31,6 +31,11 @@ env:
   # Размер словаря ~1.8 МБ, поэтому тесты быстрее гонять в release.
   BIN_NAME: yol
 
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
 jobs:
   # ═══════════════════════════════════════════════════════════════════════════
   #  STAGE 1 — тесты и линтеры
@@ -80,7 +85,41 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy (all targets, all features, deny warnings)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        id: clippy_all
+        run: cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tee /tmp/clippy.log; exit ${PIPESTATUS[0]}
+        continue-on-error: true
+
+      - name: Clippy report (comment clippy log on PR)
+        if: always() && steps.clippy_all.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let log = '';
+            try { log = fs.readFileSync('/tmp/clippy.log','utf8'); } catch(e) { log = 'no log file'; }
+            if (log.length > 50000) log = log.slice(-50000);
+            let pr = context.payload.pull_request?.number;
+            if (!pr) {
+              const ref = context.ref.replace('refs/heads/','');
+              const { data: prs } = await github.rest.pulls.list({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                head: `${context.repo.owner.login}:${ref}`,
+                state: 'open'
+              });
+              if (prs.length) pr = prs[0].number;
+            }
+            if (!pr) { core.info('no PR'); return; }
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: pr,
+              body: `**clippy (all-features) log**\n\`\`\`\n${log}\n\`\`\``
+            });
+
+      - name: Fail if clippy failed
+        if: steps.clippy_all.outcome == 'failure'
+        run: exit 1
 
       - name: Build tests
         run: cargo test --no-run --all-targets
