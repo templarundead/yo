@@ -49,7 +49,6 @@
 
 mod fonts;
 
-use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
@@ -3855,6 +3854,7 @@ enum StdinKind {
 ///
 /// На Unix — по `is_terminal()` и метаданным `/proc/self/fd/0`/`/dev/stdin`,
 /// на Windows — по `GetFileType`/`GetConsoleMode`.
+#[allow(clippy::needless_return)]
 fn stdin_kind() -> StdinKind {
     if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         return StdinKind::Terminal;
@@ -4910,8 +4910,8 @@ mod cli_mode_tests {
 
     fn args_with(input: Option<&str>, output: Option<&str>) -> Args {
         let mut a = Args {
-            input: input.map(|s| PathBuf::from(s)),
-            output: output.map(|s| PathBuf::from(s)),
+            input: input.map(PathBuf::from),
+            output: output.map(PathBuf::from),
             in_enc: None,
             out_enc: None,
             gui: false,
