@@ -1009,6 +1009,14 @@ pub struct AskRequest {
     pub wrong_ye: bool,
     /// Какой вариант подсветить первым.
     pub focus_first: bool,
+    /// Начало спорного слова в исходном тексте — смещение в **байтах**.
+    ///
+    /// Нужно интерфейсу: оригинал выделял слово прямо в редакторе
+    /// (`Editor.SelStart := Idx; Editor.SelLength := Length(Word1)`),
+    /// и порт делает то же самое через `TextEditState`.
+    pub word_start: usize,
+    /// Конец спорного слова — смещение в байтах, не включая.
+    pub word_end: usize,
 }
 
 impl AskRequest {
@@ -1020,6 +1028,24 @@ impl AskRequest {
         s.push_str(&self.after);
         s
     }
+
+    /// Адрес слова в **символах** — в таком виде его понимает
+    /// `egui::text::TextEditState` (там индексы `CCursor` считаются по
+    /// символам, а не по байтам).
+    ///
+    /// `text` — текущее содержимое единого буфера: во время прогона оно
+    /// постепенно переписывается «на месте», но длина в символах сохраняется,
+    /// поэтому `word_start`/`word_end` из исходника продолжают указывать на то
+    /// же слово. Если диапазон всё же не ложится на границы символов
+    /// (текст успели отредактировать), возвращается `None` — выделять нечего.
+    pub fn char_range(&self, text: &str) -> Option<(usize, usize)> {
+        let start = self.word_start.min(text.len());
+        let end = self.word_end.min(text.len());
+        if start > end || !text.is_char_boundary(start) || !text.is_char_boundary(end) {
+            return None;
+        }
+        Some((text[..start].chars().count(), text[..end].chars().count()))
+    }
 }
 
 /// Всё, что движок отдаёт наружу. Реализуется и GUI (через `mpsc::Sender`),
@@ -1027,6 +1053,10 @@ impl AskRequest {
 pub trait Sink {
     /// Очередной кусок готового текста. `base` — смещение в байтах от начала
     /// результата, `marks` — интервалы изменённых букв **относительно `base`**.
+    ///
+    /// `base` заодно задаёт длину уже готового префикса: интерфейс с единым
+    /// буфером просто делает `text.truncate(base)` и дописывает порцию — так
+    /// текст переписывается «на месте», как единственный RichEdit оригинала.
     fn chunk(&mut self, base: usize, text: &str, marks: &[(usize, usize)]);
 
     /// Промежуточная статистика (~15 раз в секунду).
@@ -1579,6 +1609,8 @@ impl Engine {
                     replaced_yo,
                     wrong_ye,
                     focus_first,
+                    word_start,
+                    word_end,
                 };
                 match sink.ask(req) {
                     AskDecision::Ye => focus = 1,
@@ -1972,6 +2004,66 @@ mod tests {
         };
         let stats = engine.process(input, &mut sink);
         (sink.text, stats)
+    }
+
+    /// Приёмник, запоминающий вопросы движка.
+    struct Recorder {
+        text: String,
+        asks: Vec<AskRequest>,
+    }
+
+    impl Sink for Recorder {
+        fn chunk(&mut self, _base: usize, text: &str, _marks: &[(usize, usize)]) {
+            self.text.push_str(text);
+        }
+        fn stats(&mut self, _s: Stats) {}
+        fn ask(&mut self, r: AskRequest) -> AskDecision {
+            self.asks.push(r);
+            AskDecision::Yo
+        }
+        fn undo(&mut self, _o: usize, _old: &str, _new: &str) {}
+        fn is_cancelled(&self) -> bool {
+            false
+        }
+    }
+
+    fn ask_once(src: &str) -> AskRequest {
+        let o = YoOptions {
+            always_ask: true,
+            ..Default::default()
+        };
+        let mut engine = Engine::new(o);
+        let mut sink = Recorder {
+            text: String::new(),
+            asks: Vec::new(),
+        };
+        engine.process(src, &mut sink);
+        assert_eq!(sink.asks.len(), 1, "ожидался ровно один вопрос");
+        sink.asks.remove(0)
+    }
+
+    #[test]
+    fn ask_reports_word_offsets_in_bytes_and_chars() {
+        let src = "Рама, актер вышел";
+        let req = ask_once(src);
+
+        assert_eq!(&src[req.word_start..req.word_end], "актер");
+        // «Рама» — 8 байт (4 двухбайтовых символа), «, » — ещё 2 байта,
+        // значит в символах слово начинается с шестой позиции.
+        assert_eq!(req.char_range(src), Some((6, 11)));
+    }
+
+    #[test]
+    fn ask_char_range_rejects_a_split_character() {
+        let src = "Рама, актер вышел";
+        let mut req = ask_once(src);
+        // Байт 1 — середина двухбайтовой «Р»: выделить такой диапазон нельзя.
+        req.word_start = 1;
+        assert_eq!(req.char_range(src), None);
+        // А выход за конец буфера просто обрезается.
+        req.word_start = req.word_end;
+        req.word_end = src.len() + 16;
+        assert_eq!(req.char_range(src), Some((11, 17)));
     }
 
     #[test]

@@ -81,6 +81,125 @@ fn process(input: &str, opts: YoOptions) -> (Collect, Stats) {
     (sink, stats)
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+//  Единый буфер («на месте», как единственный RichEdit оригинала)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Приёмник, повторяющий логику интерфейса с единым буфером: каждая порция
+/// применяется к тому же самому `String`, что показывает редактор.
+///
+/// Так же, как в `YoApp::apply_chunk`: `text.truncate(base)`, порция
+/// результата, затем ещё не обработанный остаток исходника. Длина буфера
+/// обязана оставаться неизменной — иначе «на месте» ничего не выйдет.
+struct InPlace {
+    text: String,
+    source: String,
+    emitted: usize,
+    lengths: Vec<usize>,
+    marks: Vec<(usize, usize)>,
+}
+
+impl InPlace {
+    fn new(source: &str) -> Self {
+        Self {
+            text: source.to_owned(),
+            source: source.to_owned(),
+            emitted: 0,
+            lengths: Vec::new(),
+            marks: Vec::new(),
+        }
+    }
+}
+
+impl Sink for InPlace {
+    fn chunk(&mut self, base: usize, text: &str, marks: &[(usize, usize)]) {
+        assert_eq!(base, self.emitted, "порции должны идти строго по порядку");
+        assert!(
+            self.text.is_char_boundary(base),
+            "base не на границе символа"
+        );
+
+        for &(s, e) in marks {
+            self.marks.push((base + s, base + e));
+        }
+
+        // Ровно то, что делает GUI: обрезаем префикс и переписываем его.
+        self.text.truncate(base);
+        self.text.push_str(text);
+        self.emitted = base + text.len();
+
+        // Возвращаем ещё не обработанный хвост исходника.
+        if self.emitted < self.source.len() {
+            assert!(
+                self.source.is_char_boundary(self.emitted),
+                "хвост исходника разрезан посередине символа"
+            );
+            self.text.push_str(&self.source[self.emitted..]);
+        }
+
+        assert_eq!(
+            self.text.len(),
+            self.source.len(),
+            "единый буфер не должен менять длину"
+        );
+        self.lengths.push(self.text.len());
+    }
+
+    fn stats(&mut self, _stats: Stats) {}
+
+    fn ask(&mut self, _req: AskRequest) -> AskDecision {
+        AskDecision::Yo
+    }
+
+    fn undo(&mut self, offset: usize, old: &str, new: &str) {
+        let end = offset + new.len();
+        if end <= self.text.len() && &self.text[offset..end] == new {
+            self.text.replace_range(offset..end, old);
+        }
+        self.marks.retain(|&(s, _)| !(s >= offset && s < end));
+    }
+
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
+#[test]
+fn single_buffer_is_rewritten_in_place() {
+    let src = "Актер вышел на сцену, а береза стояла у елки. ".repeat(2000);
+    let mut engine = Engine::new(YoOptions::default());
+    let mut sink = InPlace::new(&src);
+    let stats = engine.process(&src, &mut sink);
+
+    assert!(sink.lengths.len() > 1, "текст должен приходить порциями");
+    assert!(stats.checked_changed > 0);
+    assert_eq!(
+        sink.text,
+        process(&src, YoOptions::default()).0.text,
+        "единый буфер обязан совпасть с обычным результатом"
+    );
+    assert_eq!(sink.text.len(), src.len());
+    assert!(
+        !sink.marks.is_empty(),
+        "изменённые буквы должны быть помечены"
+    );
+}
+
+#[test]
+fn ask_request_points_at_the_word_in_the_single_buffer() {
+    let src = "Мама мыла раму, актер вышел";
+    let (sink, _) = process(src, opts(|o| o.always_ask = true));
+
+    assert_eq!(sink.asks.len(), 1, "вопросы: {:?}", sink.asks);
+    let ask = &sink.asks[0];
+    assert_eq!(&src[ask.word_start..ask.word_end], "актер");
+    assert_eq!(
+        ask.char_range(src),
+        Some((16, 21)),
+        "GUI выделяет слово по индексам символов"
+    );
+}
+
 fn opts(mutate: impl FnOnce(&mut YoOptions)) -> YoOptions {
     let mut o = YoOptions::default();
     mutate(&mut o);
