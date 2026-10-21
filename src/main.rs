@@ -1698,13 +1698,15 @@ impl YoApp {
             // буфер обмена и прислать `Event::Paste` — отдельный `arboard`
             // не нужен.
             let idle = !self.busy();
-            let can_cut = idle && self.has_selection(ctx);
+            let has_sel = self.has_selection(ctx);
+            let can_copy = has_sel;
+            let can_cut = idle && has_sel;
             if Self::menu_item(ui, "Вырезать", "Ctrl+X", can_cut) {
                 ctx.memory_mut(|m| m.request_focus(text_edit_id()));
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestCut);
                 ui.close_menu();
             }
-            if Self::menu_item(ui, "Копировать", "Ctrl+C", can_cut) {
+            if Self::menu_item(ui, "Копировать", "Ctrl+C", can_copy) {
                 if let Some(text) = self.selected_text(ctx) {
                     ctx.copy_text(text);
                 }
@@ -1716,7 +1718,7 @@ impl YoApp {
                 ctx.send_viewport_cmd(egui::ViewportCommand::RequestPaste);
                 ui.close_menu();
             }
-            if Self::menu_item(ui, "Выделить всё", "Ctrl+A", idle) {
+            if Self::menu_item(ui, "Выделить всё", "Ctrl+A", !self.text.is_empty()) {
                 self.select_all(ctx);
                 ui.close_menu();
             }
@@ -1991,23 +1993,28 @@ impl YoApp {
 
             let mut changed = false;
             let mut menu: Option<EditorMenu> = None;
-            // Всё, что нужно контекстному меню, считаем до `TextEdit`:
-            // его `&mut self.text` держится до конца блока.
             let has_sel = self.has_selection(ctx);
             let can_paste = !busy;
             let can_clear = !busy && !self.text.is_empty();
             let ask_plate = color32a(self.ask_plate);
             let ask_underline = self.ask_underline;
+            // Запоминаем выделение до кадра — правый клик не должен его сбрасывать
+            let prev_selection = TextEditState::load(ctx, text_edit_id())
+                .and_then(|s| s.cursor.char_range());
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    let edit = egui::TextEdit::multiline(&mut self.text)
+                    // Текстовый редактор должен оставаться выделяемым даже при ёфикации,
+                    // иначе скопировать мышью нельзя. Поэтому interactive всегда true,
+                    // а правку при busy просто игнорируем.
+                    let mut edit_text = self.text.clone();
+                    let edit = egui::TextEdit::multiline(&mut edit_text)
                         .id(text_edit_id())
                         .font(font.font_id())
                         .desired_width(width)
                         .desired_rows(rows)
                         .frame(false)
-                        .interactive(!busy)
+                        .interactive(true)
                         .hint_text(
                             "Вставьте текст или загрузите файл (Файл → Загрузить текст…)",
                         )
@@ -2015,6 +2022,25 @@ impl YoApp {
                         // подсветку замен и синтетический курсив.
                         .layouter(&mut layouter);
                     let out = edit.show(ui);
+
+                    // Правый клик внутри выделения не должен сбрасывать выделение
+                    if ui.ctx().input(|i| i.pointer.secondary_clicked()) {
+                        if let Some(prev) = prev_selection {
+                            if prev.primary.index != prev.secondary.index {
+                                if let Some(mut state) =
+                                    TextEditState::load(ctx, text_edit_id())
+                                {
+                                    let cur = state.cursor.char_range();
+                                    if cur.map_or(true, |r| {
+                                        r.primary.index == r.secondary.index
+                                    }) {
+                                        state.cursor.set_char_range(Some(prev));
+                                        state.store(ctx, text_edit_id());
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     // ── контекстное меню правой кнопки ─────────────────
                     out.response.context_menu(|ui| {
@@ -2042,6 +2068,12 @@ impl YoApp {
                     });
 
                     changed = out.response.changed();
+                    if changed && !busy {
+                        self.text = edit_text;
+                    } else if changed && busy {
+                        // Правку во время ёфикации игнорируем, но сохраняем
+                        // выделение (оно уже в TextEditState)
+                    }
                     if let Some(range) = ask_word {
                         // `TextEdit` рисует выделение только в фокусе, а
                         // read-only редактор его не получает — подсвечиваем
@@ -2083,8 +2115,8 @@ impl YoApp {
                 None => {}
             }
 
-            if changed {
-                // Ручная правка делает пометки неверными.
+            if changed && !busy {
+                // Ручная правка делает пометки неверными (во время ёфикации правка игнорируется)
                 self.marks.clear();
                 self.text_chars = self.text.chars().count();
             }
@@ -2639,10 +2671,21 @@ fn ask_panel_ui(
     let mut row = egui::Rect::NOTHING;
 
     ui.add_space(6.0);
-    // Живой контекст слова — вместо статичной подсказки: слева и справа от
-    // спорного слова, как `reAskText`/`FindContext` оригинала. Слово
-    // подсвечено цветом из настроек; строка обрезается по ширине окна.
-    ui.add(egui::Label::new(ask_context_job(ask, ask_text, plate)).truncate());
+    // Живой контекст слова — во всю длину панели и по центру, как на скриншоте:
+    // «хотя мы всё ещё не…» должно быть посередине, а не прижато к левому краю.
+    // Делаем Label selectable, чтобы его тоже можно было скопировать.
+    ui.allocate_ui_with_layout(
+        egui::vec2(ui.available_width(), 18.0),
+        egui::Layout::centered_and_justified(egui::Direction::LeftToRight),
+        |ui| {
+            ui.add(
+                egui::Label::new(ask_context_job(ask, ask_text, plate))
+                    .halign(egui::Align::Center)
+                    .selectable(true)
+                    .truncate(),
+            );
+        },
+    );
     ui.add_space(4.0);
     ui.vertical_centered(|ui| {
         egui::Frame::group(ui.style())
