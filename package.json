@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "rustfmt": "^0.1.0"
+  }
+}
