@@ -3689,13 +3689,130 @@ impl Args {
     /// Консольный режим: задан файл ввода/вывода, явно указан `-`
     /// (stdin/stdout) либо stdin перенаправлен — `cat файл.txt | yol`.
     ///
-    /// Оговорка: у GUI-приложения, запущенного из .desktop-файла, stdin
-    /// обычно тоже не терминал, поэтому такой запуск нужно помечать `-g`.
+    /// Двойной клик по `yol.exe` на Windows и запуск из ярлыка
+    /// (`.desktop`, `.lnk`) не должны попадать в консольный режим,
+    /// хотя `stdin.is_terminal()` там тоже `false` (у GUI-программы
+    /// вообще нет консоли). Поэтому смотрим не просто «не терминал»,
+    /// а именно «труба/файл» через [`stdin_kind`].
     fn is_cli(&self) -> bool {
+        self.is_cli_with(stdin_kind())
+    }
+
+    /// Вариант [`is_cli`] с явным видом stdin — удобен для тестов.
+    fn is_cli_with(&self, kind: StdinKind) -> bool {
         !self.help
             && !self.version
             && !self.gui
-            && (self.input.is_some() || self.output.is_some() || !std::io::stdin().is_terminal())
+            && (self.input.is_some()
+                || self.output.is_some()
+                || matches!(kind, StdinKind::Pipe | StdinKind::File))
+    }
+}
+
+/// Куда подключён stdin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StdinKind {
+    /// Интерактивный терминал.
+    Terminal,
+    /// `echo foo | yol` или `yol < file`.
+    Pipe,
+    /// Перенаправление из файла (`< file` на некоторых системах даёт File).
+    File,
+    /// Нет консоли и не труба/файл — двойной клик, ярлык, .desktop без терминала.
+    Other,
+}
+
+/// Определить вид stdin без блокировки.
+///
+/// На Unix — по `is_terminal()` и метаданным `/proc/self/fd/0`/`/dev/stdin`,
+/// на Windows — по `GetFileType`/`GetConsoleMode`.
+fn stdin_kind() -> StdinKind {
+    if std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        return StdinKind::Terminal;
+    }
+    #[cfg(unix)]
+    {
+        return stdin_kind_unix();
+    }
+    #[cfg(windows)]
+    {
+        return stdin_kind_windows();
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        return StdinKind::Other;
+    }
+}
+
+#[cfg(unix)]
+fn stdin_kind_unix() -> StdinKind {
+    use std::os::unix::fs::FileTypeExt;
+    // Проверяем оба пути: /proc/self/fd/0 точнее, /dev/stdin — запасной.
+    for path in ["/proc/self/fd/0", "/dev/stdin"] {
+        if let Ok(meta) = std::fs::metadata(path) {
+            let ft = meta.file_type();
+            if ft.is_fifo() {
+                return StdinKind::Pipe;
+            }
+            if ft.is_file() {
+                return StdinKind::File;
+            }
+            // Сокет тоже встречается при перенаправлении через сеть
+            #[cfg(target_os = "linux")]
+            {
+                if ft.is_socket() {
+                    return StdinKind::Pipe;
+                }
+            }
+            if ft.is_char_device() {
+                // /dev/null, /dev/zero и т.п. — не считаем CLI
+                // (сюда попадает и двойной клик без консоли)
+                continue;
+            }
+        }
+    }
+    // Fallback: если не смогли определить, но не терминал — считаем Other,
+    // чтобы не открывать консольный режим на двойной клик.
+    StdinKind::Other
+}
+
+#[cfg(windows)]
+mod win_stdin {
+    extern "system" {
+        pub fn GetFileType(hFile: *mut std::ffi::c_void) -> u32;
+        pub fn GetConsoleMode(hConsoleHandle: *mut std::ffi::c_void, lpMode: *mut u32) -> i32;
+    }
+}
+
+#[cfg(windows)]
+fn stdin_kind_windows() -> StdinKind {
+    use std::os::windows::io::AsRawHandle;
+    let handle = std::io::stdin().as_raw_handle();
+    if handle.is_null() {
+        return StdinKind::Other;
+    }
+    // FILE_TYPE_* из WinBase.h
+    const FILE_TYPE_UNKNOWN: u32 = 0;
+    const FILE_TYPE_DISK: u32 = 1;
+    const FILE_TYPE_CHAR: u32 = 2;
+    const FILE_TYPE_PIPE: u32 = 3;
+    unsafe {
+        let ft = win_stdin::GetFileType(handle as *mut _);
+        match ft {
+            FILE_TYPE_PIPE => StdinKind::Pipe,
+            FILE_TYPE_DISK => StdinKind::File,
+            FILE_TYPE_CHAR => {
+                // Консоль — уже отсеяли is_terminal, но проверим на всякий случай
+                let mut mode: u32 = 0;
+                if win_stdin::GetConsoleMode(handle as *mut _, &mut mode as *mut _) != 0 {
+                    StdinKind::Terminal
+                } else {
+                    // NUL, CON и прочие char-устройства без консоли
+                    StdinKind::Other
+                }
+            }
+            FILE_TYPE_UNKNOWN | _ => StdinKind::Other,
+        }
     }
 }
 
@@ -4655,5 +4772,117 @@ mod helper_tests {
         assert!(read.opts.always_ask);
         assert_eq!(read.recent, vec![PathBuf::from("/tmp/книга.fb2")]);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod cli_mode_tests {
+    use super::*;
+
+    fn args_with(input: Option<&str>, output: Option<&str>) -> Args {
+        let mut a = Args {
+            input: input.map(|s| PathBuf::from(s)),
+            output: output.map(|s| PathBuf::from(s)),
+            in_enc: None,
+            out_enc: None,
+            gui: false,
+            quiet: false,
+            opts: YoOptions::default(),
+            help: false,
+            version: false,
+            error: None,
+        };
+        a.opts.ambiguous = AmbiguousPolicy::Ask;
+        a
+    }
+
+    #[test]
+    fn double_click_opens_window_not_cli() {
+        let a = args_with(None, None);
+        assert!(
+            !a.is_cli_with(StdinKind::Other),
+            "двойной клик должен открывать окно, а не консольный режим"
+        );
+        assert!(
+            !a.is_cli_with(StdinKind::Terminal),
+            "терминал без аргументов — тоже окно"
+        );
+    }
+
+    #[test]
+    fn pipe_triggers_cli() {
+        let a = args_with(None, None);
+        assert!(
+            a.is_cli_with(StdinKind::Pipe),
+            "cat file | yol должен идти в консольный режим"
+        );
+    }
+
+    #[test]
+    fn file_redirect_triggers_cli() {
+        let a = args_with(None, None);
+        assert!(
+            a.is_cli_with(StdinKind::File),
+            "yol < file должен идти в консольный режим"
+        );
+    }
+
+    #[test]
+    fn explicit_input_forces_cli_even_on_terminal() {
+        let a = args_with(Some("in.txt"), None);
+        assert!(
+            a.is_cli_with(StdinKind::Terminal),
+            "-i должен форсировать CLI даже в терминале"
+        );
+        assert!(
+            a.is_cli_with(StdinKind::Other),
+            "-i должен форсировать CLI даже при Other"
+        );
+    }
+
+    #[test]
+    fn explicit_output_forces_cli() {
+        let a = args_with(None, Some("out.txt"));
+        assert!(a.is_cli_with(StdinKind::Terminal));
+        assert!(a.is_cli_with(StdinKind::Other));
+    }
+
+    #[test]
+    fn dash_means_explicit_stdio() {
+        let a = args_with(Some("-"), None);
+        assert!(a.is_cli_with(StdinKind::Terminal));
+        let a = Args::parse(["yol".to_string(), "-".to_string()].into_iter());
+        assert!(a.input.is_some());
+        assert!(a.is_cli_with(StdinKind::Terminal));
+    }
+
+    #[test]
+    fn help_and_version_never_cli() {
+        let mut a = args_with(Some("in.txt"), None);
+        a.help = true;
+        assert!(!a.is_cli_with(StdinKind::Pipe), "--help не CLI");
+        a.help = false;
+        a.version = true;
+        assert!(!a.is_cli_with(StdinKind::Pipe), "--version не CLI");
+    }
+
+    #[test]
+    fn gui_flag_forces_window_even_with_pipe() {
+        let mut a = args_with(None, None);
+        a.gui = true;
+        assert!(
+            !a.is_cli_with(StdinKind::Pipe),
+            "-g должен открывать окно даже с трубой"
+        );
+        assert!(!a.is_cli_with(StdinKind::File));
+    }
+
+    #[test]
+    fn stdin_kind_does_not_panic() {
+        let k = stdin_kind();
+        assert!(matches!(
+            k,
+            StdinKind::Terminal | StdinKind::Pipe | StdinKind::File | StdinKind::Other
+        ));
     }
 }

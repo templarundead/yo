@@ -1469,18 +1469,25 @@ impl Engine {
 
         let sel = self.select_word(word, word_start, word_end, terminator, input, sink);
 
-        if sel.cancel {
-            // «Прервать» (и «Откат», который тоже останавливает прогон):
-            // слово остаётся без изменений, обработка прекращается.
-            // Вопрос к этому моменту уже задан — учитываем его в статистике.
+        if sel.undo {
+            // «Откат» — откатить последнюю замену и продолжить ёфикацию,
+            // а не прерывать её (как в оригинале `DoYoficate` → `MakeUndo`).
             if sel.asked {
                 self.stats.asked += 1;
                 self.stats.asked_not_changed += 1;
             }
             self.out.push_str(word);
-            if sel.undo {
-                self.apply_undo(sink);
+            self.apply_undo(sink);
+            return false;
+        }
+
+        if sel.cancel {
+            // «Прервать» — слово остаётся без изменений, обработка прекращается.
+            if sel.asked {
+                self.stats.asked += 1;
+                self.stats.asked_not_changed += 1;
             }
+            self.out.push_str(word);
             return true;
         }
 
@@ -1747,7 +1754,6 @@ impl Engine {
                         }
                     }
                     AskDecision::Undo => {
-                        sel.cancel = true;
                         sel.undo = true;
                     }
                     AskDecision::Cancel => sel.cancel = true,
