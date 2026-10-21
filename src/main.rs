@@ -87,9 +87,10 @@ const VERSION: &str = yol::yo_core::YO_VERSION;
 /// файловый режим (он потоковый и ничем не ограничен).
 const MAX_EDITOR_CHARS: usize = 4_000_000;
 
-/// Выше этой длины отключаем подсветку: `LayoutJob` строится за O(меток).
-/// Раньше было 400k — на 1.8M тексте из скриншота подсветка пропадала.
-const MAX_HIGHLIGHT_CHARS: usize = 4_000_000;
+/// Выше этой длины `LayoutJob` с подсветкой строить дорого —
+// для больших файлов используем оверлей-отрисовку вместо LayoutJob,
+// чтобы ресайз окна не лагал.
+const MAX_HIGHLIGHT_CHARS: usize = 400_000;
 
 /// Ограничение на число запоминаемых пометок в GUI.
 const MAX_GUI_MARKS: usize = 200_000;
@@ -2070,10 +2071,16 @@ impl YoApp {
 
                     changed = out.response.changed();
                     if changed && !busy {
-                        self.text = edit_text;
+                        self.text = edit_text.clone();
                     } else if changed && busy {
                         // Правку во время ёфикации игнорируем, но сохраняем
                         // выделение (оно уже в TextEditState)
+                    }
+                    // Для больших файлов (>400k) LayoutJob не красит буквы,
+                    // чтобы ресайз не лагал — рисуем подсветку оверлеем
+                    // (дешевле, только видимые метки).
+                    if !highlighted && !marks.is_empty() {
+                        paint_marks_overlay(ui, &out, &edit_text, marks, mark_bg);
                     }
                     if let Some(range) = ask_word {
                         // `TextEdit` рисует выделение только в фокусе, а
@@ -2576,6 +2583,80 @@ fn paint_ask_word(
             egui::pos2(caret_end.left(), caret_end.bottom()),
         );
         paint_word_rect(&painter, rect, plate, underline);
+    }
+}
+
+/// Оверлей-подсветка для больших файлов: LayoutJob не используем (лагает на ресайзе),
+// рисуем фон меток прямо на galley, только видимые.
+fn paint_marks_overlay(
+    ui: &egui::Ui,
+    out: &egui::widgets::text_edit::TextEditOutput,
+    text: &str,
+    marks: &[(usize, usize)],
+    bg: egui::Color32,
+) {
+    if marks.is_empty() || bg == egui::Color32::TRANSPARENT {
+        return;
+    }
+    let galley = &out.galley;
+    let n_chars = galley.text().chars().count();
+    let painter = ui.painter_at(out.text_clip_rect);
+    let clip = out.text_clip_rect;
+    for &(s, e) in marks {
+        if s >= text.len() || e > text.len() || !text.is_char_boundary(s) || !text.is_char_boundary(e) {
+            continue;
+        }
+        let start = byte_to_char(text, s);
+        let end = byte_to_char(text, e);
+        if start >= end || end > n_chars {
+            continue;
+        }
+        let caret_start = galley
+            .pos_from_cursor(&galley.from_ccursor(CCursor::new(start)))
+            .translate(out.galley_pos.to_vec2());
+        let caret_end = galley
+            .pos_from_cursor(&galley.from_ccursor(CCursor::new(end)))
+            .translate(out.galley_pos.to_vec2());
+        // Cull вне экрана по вертикали
+        let min_y = caret_start.top().min(caret_end.top());
+        let max_y = caret_start.bottom().max(caret_end.bottom());
+        if max_y < clip.top() || min_y > clip.bottom() {
+            continue;
+        }
+        let first = caret_start.center().y;
+        let last = caret_end.center().y;
+        if (first - last).abs() < 0.5 {
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(caret_start.left(), caret_start.top()),
+                egui::pos2(caret_end.left(), caret_start.bottom()),
+            );
+            painter.rect_filled(rect.expand2(egui::vec2(1.0, 0.5)), 1.5, bg);
+        } else {
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(caret_start.left(), caret_start.top()),
+                egui::pos2(galley.rect.right() + out.galley_pos.x, caret_start.bottom()),
+            );
+            if clip.intersects(rect) {
+                painter.rect_filled(rect.expand2(egui::vec2(1.0, 0.5)), 1.5, bg);
+            }
+            for row in galley.rows.iter() {
+                let row_rect = row.rect.translate(out.galley_pos.to_vec2());
+                if row_rect.center().y <= first + 0.5 || row_rect.center().y >= last - 0.5 {
+                    continue;
+                }
+                if !clip.intersects(row_rect) {
+                    continue;
+                }
+                painter.rect_filled(row_rect.expand2(egui::vec2(1.0, 0.5)), 1.5, bg);
+            }
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(out.galley_pos.x, caret_end.top()),
+                egui::pos2(caret_end.left(), caret_end.bottom()),
+            );
+            if clip.intersects(rect) {
+                painter.rect_filled(rect.expand2(egui::vec2(1.0, 0.5)), 1.5, bg);
+            }
+        }
     }
 }
 
