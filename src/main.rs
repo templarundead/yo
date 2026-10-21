@@ -88,7 +88,8 @@ const VERSION: &str = yol::yo_core::YO_VERSION;
 const MAX_EDITOR_CHARS: usize = 4_000_000;
 
 /// Выше этой длины отключаем подсветку: `LayoutJob` строится за O(меток).
-const MAX_HIGHLIGHT_CHARS: usize = 400_000;
+/// Раньше было 400k — на 1.8M тексте из скриншота подсветка пропадала.
+const MAX_HIGHLIGHT_CHARS: usize = 4_000_000;
 
 /// Ограничение на число запоминаемых пометок в GUI.
 const MAX_GUI_MARKS: usize = 200_000;
