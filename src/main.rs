@@ -829,7 +829,8 @@ impl YoApp {
     /// Пересобрать кэш байтовых смещений символов.
     fn rebuild_byte_cache(&mut self) {
         self.text_byte_offsets.clear();
-        self.text_byte_offsets.reserve(self.text.chars().count() + 1);
+        self.text_byte_offsets
+            .reserve(self.text.chars().count() + 1);
         for (b, _) in self.text.char_indices() {
             self.text_byte_offsets.push(b);
         }
@@ -847,7 +848,10 @@ impl YoApp {
 
     #[inline]
     fn char_to_byte_cached(&self, ch: usize) -> usize {
-        self.text_byte_offsets.get(ch).copied().unwrap_or(self.text.len())
+        self.text_byte_offsets
+            .get(ch)
+            .copied()
+            .unwrap_or(self.text.len())
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -2645,10 +2649,7 @@ fn paint_marks_overlay(
     byte_offsets: &[usize],
     bg: egui::Color32,
 ) {
-    if marks.is_empty()
-        || bg == egui::Color32::TRANSPARENT
-        || byte_offsets.is_empty()
-    {
+    if marks.is_empty() || bg == egui::Color32::TRANSPARENT || byte_offsets.is_empty() {
         return;
     }
     let galley = &out.galley;
@@ -2696,10 +2697,7 @@ fn paint_marks_overlay(
     };
     let vis_char_start = row_starts[fv];
     let vis_char_end = row_starts[last_vis.min(row_starts.len() - 1)];
-    let vis_byte_start = byte_offsets
-        .get(vis_char_start)
-        .copied()
-        .unwrap_or(0);
+    let vis_byte_start = byte_offsets.get(vis_char_start).copied().unwrap_or(0);
     let vis_byte_end = byte_offsets
         .get(vis_char_end)
         .copied()
