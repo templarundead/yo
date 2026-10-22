@@ -2018,14 +2018,25 @@ impl YoApp {
                 && !self.marks.is_empty()
                 && self.text.len() <= MAX_HIGHLIGHT_CHARS;
 
-            let marks: &[(usize, usize)] = &self.marks;
+            // Клонируем необходимое для layouter, чтобы не держать ссылку на self.marks
+            // через замыкание (иначе borrow checker ругается при `self.text = ...` внутри).
+            let marks_for_layouter = if highlighted {
+                self.marks.clone()
+            } else {
+                Vec::new()
+            };
             let font = self.editor_font.clone();
             let mark_text = color32(self.mark_text);
             let mark_bg = color32(self.mark_bg);
-            let mut layouter = |ui: &egui::Ui, s: &str, wrap_width: f32| {
-                let mut job = highlight_job(ui, s, marks, &font, mark_text, mark_bg, highlighted);
-                job.wrap.max_width = wrap_width;
-                ui.fonts(|f| f.layout_job(job))
+            let mut layouter = {
+                let marks = marks_for_layouter.clone();
+                let font = font.clone();
+                move |ui: &egui::Ui, s: &str, wrap_width: f32| {
+                    let mut job =
+                        highlight_job(ui, s, &marks, &font, mark_text, mark_bg, highlighted);
+                    job.wrap.max_width = wrap_width;
+                    ui.fonts(|f| f.layout_job(job))
+                }
             };
 
             let row_height = ui.fonts(|f| f.row_height(&font.font_id())).max(1.0);
@@ -2048,6 +2059,14 @@ impl YoApp {
             // Запоминаем выделение до кадра — правый клик не должен его сбрасывать
             let prev_selection = TextEditState::load(ctx, text_edit_id())
                 .and_then(|s| s.cursor.char_range());
+            // Сырые указатели для оверлея — чтобы не держать &self.marks через замыкание
+            // (иначе borrow checker не даёт &mut self для `self.text = ...`).
+            let overlay_marks_ptr = self.marks.as_ptr() as *const (usize, usize);
+            let overlay_marks_len = self.marks.len();
+            let overlay_byte_offsets_ptr = self.text_byte_offsets.as_ptr() as *const usize;
+            let overlay_byte_offsets_len = self.text_byte_offsets.len();
+            let overlay_bg = mark_bg;
+            let overlay_highlighted = highlighted;
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -2114,10 +2133,12 @@ impl YoApp {
                         }
                     });
 
+                    // Отложим обновление текста до после оверлея, чтобы не держать
+                    // &mut self и &self.marks одновременно.
+                    let mut pending_text: Option<String> = None;
                     changed = out.response.changed();
                     if changed && !busy {
-                        self.text = edit_text.clone();
-                        self.rebuild_byte_cache();
+                        pending_text = Some(edit_text.clone());
                     } else if changed && busy {
                         // Правку во время ёфикации игнорируем, но сохраняем
                         // выделение (оно уже в TextEditState)
@@ -2125,15 +2146,33 @@ impl YoApp {
                     // Для больших файлов (>400k) LayoutJob не красит буквы,
                     // чтобы ресайз не лагал — рисуем подсветку оверлеем
                     // (дешевле, только видимые метки).
-                    if !highlighted && !marks.is_empty() {
-                        paint_marks_overlay(
-                            ui,
-                            &out,
-                            &edit_text,
-                            marks,
-                            &self.text_byte_offsets,
-                            mark_bg,
-                        );
+                    if !overlay_highlighted {
+                        let marks_slice = unsafe {
+                            std::slice::from_raw_parts(
+                                overlay_marks_ptr as *const (usize, usize),
+                                overlay_marks_len,
+                            )
+                        };
+                        let byte_offsets_slice = unsafe {
+                            std::slice::from_raw_parts(
+                                overlay_byte_offsets_ptr as *const usize,
+                                overlay_byte_offsets_len,
+                            )
+                        };
+                        if !marks_slice.is_empty() {
+                            paint_marks_overlay(
+                                ui,
+                                &out,
+                                &edit_text,
+                                marks_slice,
+                                byte_offsets_slice,
+                                overlay_bg,
+                            );
+                        }
+                    }
+                    if let Some(t) = pending_text {
+                        self.text = t;
+                        self.rebuild_byte_cache();
                     }
                     if let Some(range) = ask_word {
                         // `TextEdit` рисует выделение только в фокусе, а
@@ -2666,7 +2705,7 @@ fn paint_marks_overlay(
     row_starts.push(0);
     for row in &galley.rows {
         // glyphs не включают \n, но char_count_including_newline учитывает его.
-        let cnt = row.char_count_including_newline().0;
+        let cnt = row.glyphs.len() + if row.ends_with_newline { 1 } else { 0 };
         cur += cnt;
         // cur не должен превышать n_chars.
         if cur > n_chars {
