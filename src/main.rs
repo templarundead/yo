@@ -847,6 +847,7 @@ impl YoApp {
     }
 
     #[inline]
+    #[allow(dead_code)]
     fn char_to_byte_cached(&self, ch: usize) -> usize {
         self.text_byte_offsets
             .get(ch)
@@ -2061,9 +2062,9 @@ impl YoApp {
                 .and_then(|s| s.cursor.char_range());
             // Сырые указатели для оверлея — чтобы не держать &self.marks через замыкание
             // (иначе borrow checker не даёт &mut self для `self.text = ...`).
-            let overlay_marks_ptr = self.marks.as_ptr() as *const (usize, usize);
+            let overlay_marks_ptr = self.marks.as_ptr();
             let overlay_marks_len = self.marks.len();
-            let overlay_byte_offsets_ptr = self.text_byte_offsets.as_ptr() as *const usize;
+            let overlay_byte_offsets_ptr = self.text_byte_offsets.as_ptr();
             let overlay_byte_offsets_len = self.text_byte_offsets.len();
             let overlay_bg = mark_bg;
             let overlay_highlighted = highlighted;
@@ -2148,14 +2149,11 @@ impl YoApp {
                     // (дешевле, только видимые метки).
                     if !overlay_highlighted {
                         let marks_slice = unsafe {
-                            std::slice::from_raw_parts(
-                                overlay_marks_ptr as *const (usize, usize),
-                                overlay_marks_len,
-                            )
+                            std::slice::from_raw_parts(overlay_marks_ptr, overlay_marks_len)
                         };
                         let byte_offsets_slice = unsafe {
                             std::slice::from_raw_parts(
-                                overlay_byte_offsets_ptr as *const usize,
+                                overlay_byte_offsets_ptr,
                                 overlay_byte_offsets_len,
                             )
                         };
