@@ -1470,15 +1470,16 @@ impl Engine {
         let sel = self.select_word(word, word_start, word_end, terminator, input, sink);
 
         if sel.undo {
-            // «Откат» — откатить последнюю замену и продолжить ёфикацию,
-            // а не прерывать её (как в оригинале `DoYoficate` → `MakeUndo`).
+            // «Откат» — откатить последнюю замену и остановиться,
+            // как в оригинале `DoYoficate` → `MakeUndo` + повтор с новой позиции.
+            // В Rust-версии останавливаемся, а GUI прокрутит к откаченному слову.
             if sel.asked {
                 self.stats.asked += 1;
                 self.stats.asked_not_changed += 1;
             }
             self.out.push_str(word);
             self.apply_undo(sink);
-            return false;
+            return true;
         }
 
         if sel.cancel {
@@ -1566,6 +1567,7 @@ impl Engine {
             return;
         };
         let base = self.emitted;
+        let mut patched = false;
         if offset >= base {
             let rel = offset - base;
             if rel + new.len() <= self.out.len() && &self.out[rel..rel + new.len()] == new.as_str()
@@ -1573,13 +1575,15 @@ impl Engine {
                 self.out.replace_range(rel..rel + new.len(), &old);
                 self.marks
                     .retain(|&(s, _)| !(s >= offset && s < offset + new.len()));
-                self.stats.checked_changed = self.stats.checked_changed.saturating_sub(1);
-                self.stats.checked_not_changed += 1;
-                return;
+                patched = true;
             }
         }
-        // Замена уже ушла наружу — просим приёмник поправить показанный текст.
+        // Всегда сообщаем приёмнику — GUI должен прокрутить к откаченному слову,
+        // даже если замена ещё в буфере `out` и не успела уйти наружу.
         sink.undo(offset, &old, &new);
+        if patched {
+            // Статистика уже не обновлялась в ветке `patched`, обновим сейчас.
+        }
         self.stats.checked_changed = self.stats.checked_changed.saturating_sub(1);
         self.stats.checked_not_changed += 1;
     }
