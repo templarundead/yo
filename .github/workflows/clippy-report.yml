@@ -1,0 +1,45 @@
+name: clippy-report
+on:
+  push:
+    branches: ["arena/**"]
+  workflow_dispatch:
+permissions:
+  pull-requests: write
+  contents: read
+jobs:
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends build-essential pkg-config libxkbcommon-dev libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev libxcursor-dev libxrandr-dev libxi-dev libwayland-dev libgl1-mesa-dev libglu1-mesa-dev libgtk-3-dev libssl-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - name: Run clippy
+        id: run
+        run: |
+          set +e
+          echo "=== clippy all-features ===" | tee clippy.log
+          cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tee -a clippy.log
+          EC1=$?
+          echo "=== clippy no-features ===" | tee -a clippy.log
+          cargo clippy --all-targets -- -D warnings 2>&1 | tee -a clippy.log
+          EC2=$?
+          EC=$((EC1||EC2))
+          echo "ec=$EC" >> $GITHUB_OUTPUT
+          exit $EC
+        continue-on-error: true
+      - name: Comment
+        if: always() && steps.run.outputs.ec != '0'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs=require('fs'); let log=''; try{log=fs.readFileSync('clippy.log','utf8')}catch(e){log='no log'}
+            if(log.length>50000) log=log.slice(-50000);
+            let pr=context.payload.pull_request?.number;
+            if(!pr){ const ref=context.ref.replace('refs/heads/',''); const {data:prs}=await github.rest.pulls.list({owner:context.repo.owner,repo:context.repo.repo,head:`${context.repo.owner.login}:${ref}`,state:'open'}); if(prs.length) pr=prs[0].number; }
+            if(!pr) return;
+            await github.rest.issues.createComment({owner:context.repo.owner,repo:context.repo.repo,issue_number:pr,body:`**clippy**\n\`\`\`\n${log}\n\`\`\``});
