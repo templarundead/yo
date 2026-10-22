@@ -607,6 +607,9 @@ struct YoApp {
     text: String,
     /// Длина `text` в символах (кэш: `chars().count()` на каждый кадр дорог).
     text_chars: usize,
+    /// Байтовые смещения каждого символа — для быстрого `byte_to_char`/`char_to_byte`.
+    /// `byte_offsets[i]` — байт начала `i`-го символа, последний элемент = `text.len()`.
+    text_byte_offsets: Vec<usize>,
     /// Снимок исходника на время прогона: из него после каждой порции
     /// возвращается ещё не обработанный хвост. Хранится в `Arc`, потому что
     /// тот же буфер читает рабочий поток.
@@ -727,6 +730,7 @@ impl YoApp {
             opts: settings.opts.clone(),
             text: String::new(),
             text_chars: 0,
+            text_byte_offsets: vec![0],
             run_source: None,
             marks: Vec::new(),
             journal: Vec::new(),
@@ -820,6 +824,35 @@ impl YoApp {
     #[inline]
     fn busy(&self) -> bool {
         self.run.is_some()
+    }
+
+    /// Пересобрать кэш байтовых смещений символов.
+    fn rebuild_byte_cache(&mut self) {
+        self.text_byte_offsets.clear();
+        self.text_byte_offsets
+            .reserve(self.text.chars().count() + 1);
+        for (b, _) in self.text.char_indices() {
+            self.text_byte_offsets.push(b);
+        }
+        self.text_byte_offsets.push(self.text.len());
+        self.text_chars = self.text_byte_offsets.len().saturating_sub(1);
+    }
+
+    #[inline]
+    fn byte_to_char_cached(&self, byte: usize) -> usize {
+        match self.text_byte_offsets.binary_search(&byte) {
+            Ok(i) => i,
+            Err(i) => i,
+        }
+    }
+
+    #[inline]
+    #[allow(dead_code)]
+    fn char_to_byte_cached(&self, ch: usize) -> usize {
+        self.text_byte_offsets
+            .get(ch)
+            .copied()
+            .unwrap_or(self.text.len())
     }
 
     // ────────────────────────────────────────────────────────────────────
@@ -1024,10 +1057,16 @@ impl YoApp {
         }
         let source = self.run_source.as_deref().map(String::as_str);
         rewrite_in_place(&mut self.text, source, base, chunk);
+        self.rebuild_byte_cache();
     }
 
     /// Откатить уже показанную замену прямо в едином буфере.
     fn patch_text(&mut self, offset: usize, old: &str, new: &str) {
+        // Курсор должен вернуться к откаченному слову независимо от того,
+        // успела ли замена попасть в буфер.
+        let ch = self.byte_to_char_cached(offset);
+        self.selection_after = Some(ch);
+        self.scroll_to_selection = Some(ch);
         let end = match offset.checked_add(new.len()) {
             Some(e) if e <= self.text.len() => e,
             _ => return,
@@ -1049,9 +1088,13 @@ impl YoApp {
                     *e = (*e as i64 + delta) as usize;
                 }
             }
-            self.text_chars = self.text.chars().count();
         }
         self.marks.retain(|&(s, _)| !(s >= offset && s < end));
+        self.rebuild_byte_cache();
+        // Откат должен вернуть курсор к откаченному слову, а не вперёд.
+        let ch = self.byte_to_char_cached(offset);
+        self.selection_after = Some(ch);
+        self.scroll_to_selection = Some(ch);
     }
 
     /// Ответить рабочему потоку на панель запроса.
@@ -1105,6 +1148,7 @@ impl YoApp {
                 let n = text.chars().count();
                 self.text = text;
                 self.text_chars = n;
+                self.rebuild_byte_cache();
                 self.run_source = None;
                 self.marks.clear();
                 self.journal.clear();
@@ -1197,6 +1241,7 @@ impl YoApp {
         }
         self.text.clear();
         self.text_chars = 0;
+        self.text_byte_offsets = vec![0];
         self.run_source = None;
         self.marks.clear();
         self.journal.clear();
@@ -1974,19 +2019,32 @@ impl YoApp {
                 && !self.marks.is_empty()
                 && self.text.len() <= MAX_HIGHLIGHT_CHARS;
 
-            let marks: &[(usize, usize)] = &self.marks;
+            // Клонируем необходимое для layouter, чтобы не держать ссылку на self.marks
+            // через замыкание (иначе borrow checker ругается при `self.text = ...` внутри).
+            let marks_for_layouter = if highlighted {
+                self.marks.clone()
+            } else {
+                Vec::new()
+            };
             let font = self.editor_font.clone();
             let mark_text = color32(self.mark_text);
             let mark_bg = color32(self.mark_bg);
-            let mut layouter = |ui: &egui::Ui, s: &str, wrap_width: f32| {
-                let mut job = highlight_job(ui, s, marks, &font, mark_text, mark_bg, highlighted);
-                job.wrap.max_width = wrap_width;
-                ui.fonts(|f| f.layout_job(job))
+            let mut layouter = {
+                let marks = marks_for_layouter.clone();
+                let font = font.clone();
+                move |ui: &egui::Ui, s: &str, wrap_width: f32| {
+                    let mut job =
+                        highlight_job(ui, s, &marks, &font, mark_text, mark_bg, highlighted);
+                    job.wrap.max_width = wrap_width;
+                    ui.fonts(|f| f.layout_job(job))
+                }
             };
 
             let row_height = ui.fonts(|f| f.row_height(&font.font_id())).max(1.0);
             let rows = ((ui.available_height() / row_height).floor() as usize).max(1);
-            let width = if self.opts.word_wrap {
+            // Для больших файлов перенос по словам выключаем — иначе каждая
+            // перерисовка на ресайзе пересобирает Galley на 1.7 Мб и лагает.
+            let width = if self.opts.word_wrap && self.text_chars <= MAX_HIGHLIGHT_CHARS {
                 ui.available_width()
             } else {
                 f32::INFINITY
@@ -2002,6 +2060,14 @@ impl YoApp {
             // Запоминаем выделение до кадра — правый клик не должен его сбрасывать
             let prev_selection = TextEditState::load(ctx, text_edit_id())
                 .and_then(|s| s.cursor.char_range());
+            // Сырые указатели для оверлея — чтобы не держать &self.marks через замыкание
+            // (иначе borrow checker не даёт &mut self для `self.text = ...`).
+            let overlay_marks_ptr = self.marks.as_ptr();
+            let overlay_marks_len = self.marks.len();
+            let overlay_byte_offsets_ptr = self.text_byte_offsets.as_ptr();
+            let overlay_byte_offsets_len = self.text_byte_offsets.len();
+            let overlay_bg = mark_bg;
+            let overlay_highlighted = highlighted;
             egui::ScrollArea::both()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
@@ -2068,9 +2134,12 @@ impl YoApp {
                         }
                     });
 
+                    // Отложим обновление текста до после оверлея, чтобы не держать
+                    // &mut self и &self.marks одновременно.
+                    let mut pending_text: Option<String> = None;
                     changed = out.response.changed();
                     if changed && !busy {
-                        self.text = edit_text.clone();
+                        pending_text = Some(edit_text.clone());
                     } else if changed && busy {
                         // Правку во время ёфикации игнорируем, но сохраняем
                         // выделение (оно уже в TextEditState)
@@ -2078,8 +2147,30 @@ impl YoApp {
                     // Для больших файлов (>400k) LayoutJob не красит буквы,
                     // чтобы ресайз не лагал — рисуем подсветку оверлеем
                     // (дешевле, только видимые метки).
-                    if !highlighted && !marks.is_empty() {
-                        paint_marks_overlay(ui, &out, &edit_text, marks, mark_bg);
+                    if !overlay_highlighted {
+                        let marks_slice = unsafe {
+                            std::slice::from_raw_parts(overlay_marks_ptr, overlay_marks_len)
+                        };
+                        let byte_offsets_slice = unsafe {
+                            std::slice::from_raw_parts(
+                                overlay_byte_offsets_ptr,
+                                overlay_byte_offsets_len,
+                            )
+                        };
+                        if !marks_slice.is_empty() {
+                            paint_marks_overlay(
+                                ui,
+                                &out,
+                                &edit_text,
+                                marks_slice,
+                                byte_offsets_slice,
+                                overlay_bg,
+                            );
+                        }
+                    }
+                    if let Some(t) = pending_text {
+                        self.text = t;
+                        self.rebuild_byte_cache();
                     }
                     if let Some(range) = ask_word {
                         // `TextEdit` рисует выделение только в фокусе, а
@@ -2125,7 +2216,7 @@ impl YoApp {
             if changed && !busy {
                 // Ручная правка делает пометки неверными (во время ёфикации правка игнорируется)
                 self.marks.clear();
-                self.text_chars = self.text.chars().count();
+                // text и кэш уже обновлены внутри ScrollArea
             }
         });
     }
@@ -2592,16 +2683,78 @@ fn paint_marks_overlay(
     out: &egui::widgets::text_edit::TextEditOutput,
     text: &str,
     marks: &[(usize, usize)],
+    byte_offsets: &[usize],
     bg: egui::Color32,
 ) {
-    if marks.is_empty() || bg == egui::Color32::TRANSPARENT {
+    if marks.is_empty() || bg == egui::Color32::TRANSPARENT || byte_offsets.is_empty() {
         return;
     }
     let galley = &out.galley;
-    let n_chars = galley.text().chars().count();
+    let n_chars = byte_offsets.len().saturating_sub(1);
+    if n_chars == 0 {
+        return;
+    }
     let painter = ui.painter_at(out.text_clip_rect);
     let clip = out.text_clip_rect;
-    for &(s, e) in marks {
+
+    // Построим таблицу char_start для каждой строки.
+    let mut row_starts = Vec::with_capacity(galley.rows.len() + 1);
+    let mut cur = 0usize;
+    row_starts.push(0);
+    for row in &galley.rows {
+        // glyphs не включают \n, но char_count_including_newline учитывает его.
+        let cnt = row.glyphs.len() + if row.ends_with_newline { 1 } else { 0 };
+        cur += cnt;
+        // cur не должен превышать n_chars.
+        if cur > n_chars {
+            cur = n_chars;
+        }
+        row_starts.push(cur);
+    }
+    // Найдём видимый диапазон строк.
+    let mut first_vis: Option<usize> = None;
+    let mut last_vis = 0usize;
+    for (i, row) in galley.rows.iter().enumerate() {
+        let r = row.rect.translate(out.galley_pos.to_vec2());
+        if r.bottom() < clip.top() {
+            continue;
+        }
+        if r.top() > clip.bottom() {
+            break;
+        }
+        if r.intersects(clip) {
+            if first_vis.is_none() {
+                first_vis = Some(i);
+            }
+            last_vis = i + 1;
+        }
+    }
+    let Some(fv) = first_vis else {
+        return;
+    };
+    let vis_char_start = row_starts[fv];
+    let vis_char_end = row_starts[last_vis.min(row_starts.len() - 1)];
+    let vis_byte_start = byte_offsets.get(vis_char_start).copied().unwrap_or(0);
+    let vis_byte_end = byte_offsets
+        .get(vis_char_end)
+        .copied()
+        .unwrap_or(text.len());
+
+    // Бинарный поиск по отсортированным marks (по s).
+    let mut start_idx = marks.partition_point(|&(s, _)| s < vis_byte_start);
+    if start_idx > 0 && marks[start_idx - 1].1 > vis_byte_start {
+        start_idx -= 1;
+    }
+    let end_idx = marks.partition_point(|&(s, _)| s < vis_byte_end);
+
+    let byte_to_char = |b: usize| -> usize {
+        match byte_offsets.binary_search(&b) {
+            Ok(i) => i,
+            Err(i) => i,
+        }
+    };
+
+    for &(s, e) in &marks[start_idx..end_idx] {
         if s >= text.len()
             || e > text.len()
             || !text.is_char_boundary(s)
@@ -2609,8 +2762,8 @@ fn paint_marks_overlay(
         {
             continue;
         }
-        let start = byte_to_char(text, s);
-        let end = byte_to_char(text, e);
+        let start = byte_to_char(s);
+        let end = byte_to_char(e);
         if start >= end || end > n_chars {
             continue;
         }
@@ -2620,7 +2773,6 @@ fn paint_marks_overlay(
         let caret_end = galley
             .pos_from_cursor(&galley.from_ccursor(CCursor::new(end)))
             .translate(out.galley_pos.to_vec2());
-        // Cull вне экрана по вертикали
         let min_y = caret_start.top().min(caret_end.top());
         let max_y = caret_start.bottom().max(caret_end.bottom());
         if max_y < clip.top() || min_y > clip.bottom() {
@@ -2642,7 +2794,8 @@ fn paint_marks_overlay(
             if clip.intersects(rect) {
                 painter.rect_filled(rect.expand2(egui::vec2(1.0, 0.5)), 1.5, bg);
             }
-            for row in galley.rows.iter() {
+            for idx in fv..last_vis {
+                let row = &galley.rows[idx];
                 let row_rect = row.rect.translate(out.galley_pos.to_vec2());
                 if row_rect.center().y <= first + 0.5 || row_rect.center().y >= last - 0.5 {
                     continue;
